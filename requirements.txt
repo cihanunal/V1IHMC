@@ -3,5 +3,4 @@ pandas
 openpyxl
 xlsxwriter
 python-docx
-gspread
-google-auth
+supabase
