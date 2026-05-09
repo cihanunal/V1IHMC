@@ -1269,14 +1269,14 @@ st.markdown(
 
 def sidebar_settings():
     st.sidebar.title("Ayarlar")
-    kat_id = st.sidebar.text_input("Katılımcı veri Sheet ID", value=DEFAULT_KATILIMCI_SHEET_ID)
-    prog_id = st.sidebar.text_input("Program/Matbaa Sheet ID", value=DEFAULT_PROGRAM_SHEET_ID)
+    kat_id = st.sidebar.text_input("Katılımcı veri Sheet ID", value=DEFAULT_KATILIMCI_SHEET_ID, key="sidebar_katilimci_sheet_id")
+    prog_id = st.sidebar.text_input("Program/Matbaa Sheet ID", value=DEFAULT_PROGRAM_SHEET_ID, key="sidebar_program_sheet_id")
     writable = has_service_account() and get_gspread_client() is not None
     if writable:
         st.sidebar.success("Google Sheets yazma modu aktif")
     else:
         st.sidebar.warning("Sadece okuma modu. Yazmak için gcp_service_account secrets gerekli.")
-    if st.sidebar.button("Verileri Yenile"):
+    if st.sidebar.button("Verileri Yenile", key="sidebar_refresh_data"):
         st.cache_data.clear()
         st.rerun()
     st.sidebar.caption("Yazma için iki Google Sheet dosyasını servis hesabı e-postasıyla paylaşın.")
@@ -1325,7 +1325,7 @@ with tab_search:
         st.session_state.arama_metni = ""
     with st.form("search_form"):
         c1, c2 = st.columns([4, 1])
-        sorgu_input = c1.text_input("Arama", value=st.session_state.arama_metni, placeholder="Örn: Cihan veya Yapay Zeka", label_visibility="collapsed")
+        sorgu_input = c1.text_input("Arama", value=st.session_state.arama_metni, placeholder="Örn: Cihan veya Yapay Zeka", label_visibility="collapsed", key="search_query_input")
         arama = c2.form_submit_button("Ara")
     if arama:
         st.session_state.arama_metni = sorgu_input
@@ -1387,10 +1387,10 @@ with tab_program:
         st.error(f"Program planı sheet'inde eksik kolonlar var: {', '.join(missing_required)}")
     else:
         f1, f2, f3 = st.columns(3)
-        q = f1.text_input("Bildiri adı filtrele", "")
-        tip_filter = f2.multiselect("Sunum tipi", sorted([x for x in df_plan["Sunum_Tipi"].dropna().unique() if safe_str(x)]))
+        q = f1.text_input("Bildiri adı filtrele", "", key="program_bildiri_filter")
+        tip_filter = f2.multiselect("Sunum tipi", sorted([x for x in df_plan["Sunum_Tipi"].dropna().unique() if safe_str(x)]), key="program_sunum_tipi_filter")
         gunler = sorted({gun_key(x) for x in df_plan["Gun_ve_Saat"].dropna().astype(str) if safe_str(x)}, key=parse_zaman)
-        gun_filter = f3.multiselect("Gün", gunler)
+        gun_filter = f3.multiselect("Gün", gunler, key="program_gun_filter")
 
         df_show = df_plan.copy()
         if q:
@@ -1408,7 +1408,7 @@ with tab_program:
 
         if not df_show.empty:
             options = {row_label(r, ["Bildiri_Adi", "Sunum_Tipi", "Gun_ve_Saat", "Salon", "Oturum_ID"]): r for _, r in df_show.iterrows()}
-            selected_label = st.selectbox("Düzenlenecek bildiriyi seç", list(options.keys()))
+            selected_label = st.selectbox("Düzenlenecek bildiriyi seç", list(options.keys()), key="program_selected_bildiri")
             selected = options[selected_label]
             selected_bildiri = safe_str(selected["Bildiri_Adi"])
 
@@ -1424,23 +1424,23 @@ with tab_program:
 
             st.write("#### Seçili Bildiriyi Taşı / Güncelle")
             with st.form("program_update_form"):
-                use_existing = st.checkbox("Mevcut bir oturuma taşı", value=True)
+                use_existing = st.checkbox("Mevcut bir oturuma taşı", value=True, key="program_use_existing_session")
                 if use_existing and session_labels:
                     current_label = f"{selected['Sunum_Tipi']} | {selected['Gun_ve_Saat']} | {selected['Salon']} | {selected['Oturum_ID']}"
                     default_index = session_labels.index(current_label) if current_label in session_labels else 0
-                    chosen_session = st.selectbox("Hedef oturum", session_labels, index=default_index)
+                    chosen_session = st.selectbox("Hedef oturum", session_labels, index=default_index, key="program_target_session")
                     chosen_parts = chosen_session.split(" | ", 3)
                     new_tip, new_time, new_salon, new_oturum = chosen_parts[0], chosen_parts[1], chosen_parts[2], chosen_parts[3]
                 else:
                     c1, c2 = st.columns(2)
-                    new_tip = c1.selectbox("Sunum tipi", ["Yuzyuze", "Online"], index=0 if safe_str(selected["Sunum_Tipi"]) != "Online" else 1)
-                    new_time = c2.text_input("Gün ve saat", value=safe_str(selected["Gun_ve_Saat"]))
+                    new_tip = c1.selectbox("Sunum tipi", ["Yuzyuze", "Online"], index=0 if safe_str(selected["Sunum_Tipi"]) != "Online" else 1, key="program_manual_tip")
+                    new_time = c2.text_input("Gün ve saat", value=safe_str(selected["Gun_ve_Saat"]), key="program_manual_time")
                     c3, c4 = st.columns(2)
                     salon_options = sorted({safe_str(x) for x in df_plan["Salon"].dropna().unique() if safe_str(x)})
                     if safe_str(selected["Salon"]) not in salon_options:
                         salon_options.insert(0, safe_str(selected["Salon"]))
-                    new_salon = c3.selectbox("Salon", salon_options) if salon_options else c3.text_input("Salon", value=safe_str(selected["Salon"]))
-                    new_oturum = c4.text_input("Oturum ID", value=safe_str(selected["Oturum_ID"]))
+                    new_salon = c3.selectbox("Salon", salon_options, key="program_manual_salon_select") if salon_options else c3.text_input("Salon", value=safe_str(selected["Salon"]), key="program_manual_salon_text")
+                    new_oturum = c4.text_input("Oturum ID", value=safe_str(selected["Oturum_ID"]), key="program_manual_oturum")
 
                 current_authors = bildiriler.get(temiz_metin(selected_bildiri), {}).get("Yazarlar", [])
                 current_presenter = bildiriler.get(temiz_metin(selected_bildiri), {}).get("Sunucu", "")
@@ -1450,10 +1450,11 @@ with tab_program:
                     "Sunacak yazar",
                     ["Değiştirme"] + author_display + ["Elle yaz"],
                     index=0,
+                    key="program_presenter_choice",
                 )
                 presenter_free = ""
                 if presenter_choice == "Elle yaz":
-                    presenter_free = st.text_input("Yeni sunucu adı", value=current_presenter)
+                    presenter_free = st.text_input("Yeni sunucu adı", value=current_presenter, key="program_presenter_free")
 
                 kaydet = st.form_submit_button("Bildiri Güncelle")
 
@@ -1497,7 +1498,7 @@ with tab_salon:
         valid = df_plan[~df_plan["Gun_ve_Saat"].isin(["", "-", "nan", "NaN", "ATANMADI", "İPTAL EDİLDİ"])].copy()
         valid["Gün"] = valid["Gun_ve_Saat"].apply(gun_key)
         gunler = sorted(valid["Gün"].dropna().unique(), key=parse_zaman)
-        secili_gun = st.selectbox("Kontrol edilecek gün", ["Tümü"] + list(gunler))
+        secili_gun = st.selectbox("Kontrol edilecek gün", ["Tümü"] + list(gunler), key="salon_control_day")
         if secili_gun != "Tümü":
             valid = valid[valid["Gün"] == secili_gun]
 
@@ -1535,7 +1536,7 @@ with tab_mod:
 
         with mod_tab1:
             options = {row_label(r, ["unvan_ad_soyad", "Gorev", "Gun_ve_Saat", "Salon", "Oturum_ID"]): r for _, r in df_mod.iterrows()}
-            selected_label = st.selectbox("Düzenlenecek moderatör/değerlendirici", list(options.keys()))
+            selected_label = st.selectbox("Düzenlenecek moderatör/değerlendirici", list(options.keys()), key="mod_selected_person")
             selected = options[selected_label]
 
             session_labels = []
@@ -1548,25 +1549,25 @@ with tab_mod:
 
             with st.form("mod_update_form"):
                 c1, c2 = st.columns(2)
-                new_name = c1.text_input("Ad Soyad / Ünvan", value=safe_str(selected.get("unvan_ad_soyad", "")))
-                new_kurum = c2.text_input("Kurum", value=safe_str(selected.get("kurum", "")))
+                new_name = c1.text_input("Ad Soyad / Ünvan", value=safe_str(selected.get("unvan_ad_soyad", "")), key="mod_name")
+                new_kurum = c2.text_input("Kurum", value=safe_str(selected.get("kurum", "")), key="mod_kurum")
                 c3, c4 = st.columns(2)
-                new_gorev = c3.text_input("Görev", value=safe_str(selected.get("Gorev", "")))
-                new_online = c4.selectbox("Online", ["Hayır", "Evet"], index=1 if safe_str(selected.get("Online", "")).lower() in ["evet", "online", "true", "1"] else 0)
+                new_gorev = c3.text_input("Görev", value=safe_str(selected.get("Gorev", "")), key="mod_gorev")
+                new_online = c4.selectbox("Online", ["Hayır", "Evet"], index=1 if safe_str(selected.get("Online", "")).lower() in ["evet", "online", "true", "1"] else 0, key="mod_online")
 
-                use_existing_session = st.checkbox("Mevcut oturuma ata", value=True)
+                use_existing_session = st.checkbox("Mevcut oturuma ata", value=True, key="mod_use_existing_session")
                 if use_existing_session and session_labels:
                     current_session = f"{'Online' if new_online == 'Evet' else 'Yuzyuze'} | {safe_str(selected.get('Gun_ve_Saat', ''))} | {safe_str(selected.get('Salon', ''))} | {safe_str(selected.get('Oturum_ID', ''))}"
                     idx = session_labels.index(current_session) if current_session in session_labels else 0
-                    chosen_session = st.selectbox("Hedef oturum", session_labels, index=idx)
+                    chosen_session = st.selectbox("Hedef oturum", session_labels, index=idx, key="mod_target_session")
                     p = chosen_session.split(" | ", 3)
                     _tip, new_time, new_salon, new_oturum = p[0], p[1], p[2], p[3]
                     new_online = "Evet" if _tip == "Online" else "Hayır"
                 else:
                     c5, c6 = st.columns(2)
-                    new_time = c5.text_input("Gün ve saat", value=safe_str(selected.get("Gun_ve_Saat", "")))
-                    new_salon = c6.text_input("Salon", value=safe_str(selected.get("Salon", "")))
-                    new_oturum = st.text_input("Oturum ID", value=safe_str(selected.get("Oturum_ID", "")))
+                    new_time = c5.text_input("Gün ve saat", value=safe_str(selected.get("Gun_ve_Saat", "")), key="mod_manual_time")
+                    new_salon = c6.text_input("Salon", value=safe_str(selected.get("Salon", "")), key="mod_manual_salon")
+                    new_oturum = st.text_input("Oturum ID", value=safe_str(selected.get("Oturum_ID", "")), key="mod_manual_oturum")
 
                 mod_kaydet = st.form_submit_button("Moderatör Kaydet")
 
@@ -1601,8 +1602,8 @@ with tab_mod:
             c1, c2 = st.columns(2)
             left_label = c1.selectbox("1. kişi", list(options.keys()), key="swap_left")
             right_label = c2.selectbox("2. kişi", list(options.keys()), key="swap_right")
-            swap_mode = st.radio("Değişim tipi", ["Oturumlarını değiştir", "Kişi isimlerini değiştir"], horizontal=True)
-            if st.button("Yer Değiştir"):
+            swap_mode = st.radio("Değişim tipi", ["Oturumlarını değiştir", "Kişi isimlerini değiştir"], horizontal=True, key="mod_swap_mode")
+            if st.button("Yer Değiştir", key="mod_swap_button"):
                 if not writable:
                     st.error("Yazma modu aktif değil.")
                 elif left_label == right_label:
@@ -1637,7 +1638,7 @@ with tab_matbaa:
         c2.metric("Yüz yüze", (df_master["Sunum_Tipi"] == "Yuzyuze").sum())
         c3.metric("Online", (df_master["Sunum_Tipi"] == "Online").sum())
 
-        if st.button("Matbaayı Çalıştır ve Dosyaları Hazırla"):
+        if st.button("Matbaayı Çalıştır ve Dosyaları Hazırla", key="matbaa_build_outputs"):
             with st.spinner("Excel ve Word çıktıları hazırlanıyor..."):
                 df_yz = df_master[df_master["Sunum_Tipi"] == "Yuzyuze"]
                 df_on = df_master[df_master["Sunum_Tipi"] == "Online"]
@@ -1655,28 +1656,28 @@ with tab_matbaa:
             c1, c2 = st.columns(2)
             with c1:
                 st.write("#### Yüz Yüze Program")
-                st.download_button("Excel İndir", outputs["excel_yz"], file_name="Nihai_Program_Yuzyuze.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.download_button("Word İndir", outputs["word_yz"], file_name="Nihai_Program_Yuzyuze.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                st.download_button("Excel İndir", outputs["excel_yz"], file_name="Nihai_Program_Yuzyuze.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_excel_yuzyuze")
+                st.download_button("Word İndir", outputs["word_yz"], file_name="Nihai_Program_Yuzyuze.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="download_word_yuzyuze")
             with c2:
                 st.write("#### Online Program")
-                st.download_button("Excel İndir", outputs["excel_on"], file_name="Nihai_Program_Online.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.download_button("Word İndir", outputs["word_on"], file_name="Nihai_Program_Online.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            st.download_button("Oturum Röntgen Özeti İndir", outputs["ozet"], file_name="Oturum_Rontgen_Ozeti.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button("Excel İndir", outputs["excel_on"], file_name="Nihai_Program_Online.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_excel_online")
+                st.download_button("Word İndir", outputs["word_on"], file_name="Nihai_Program_Online.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="download_word_online")
+            st.download_button("Oturum Röntgen Özeti İndir", outputs["ozet"], file_name="Oturum_Rontgen_Ozeti.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_oturum_ozeti")
 
 
 with tab_reports:
     st.subheader("Raporlar ve Excel İndirme Merkezi")
     c1, c2 = st.columns(2)
-    c1.download_button("Genel Katılımcı Analizi", data=make_genel_report(katilimcilar), file_name="IHMC_Genel_Rapor.xlsx", use_container_width=True)
-    c1.download_button("Sadece Online Katılımcılar", data=make_katilim_turu_report(katilimcilar, "ONLINE"), file_name="Online_Katilimcilar.xlsx", use_container_width=True)
-    c2.download_button("Ödenmemiş Bildiriler", data=make_unpaid_report(bildiriler, katilimcilar), file_name="Odenmemis_Bildiriler.xlsx", use_container_width=True)
-    c2.download_button("Sadece Fiziki Katılımcılar", data=make_katilim_turu_report(katilimcilar, "FİZİKİ"), file_name="Fiziki_Katilimcilar.xlsx", use_container_width=True)
+    c1.download_button("Genel Katılımcı Analizi", data=make_genel_report(katilimcilar), file_name="IHMC_Genel_Rapor.xlsx", use_container_width=True, key="download_genel_rapor")
+    c1.download_button("Sadece Online Katılımcılar", data=make_katilim_turu_report(katilimcilar, "ONLINE"), file_name="Online_Katilimcilar.xlsx", use_container_width=True, key="download_online_katilimcilar")
+    c2.download_button("Ödenmemiş Bildiriler", data=make_unpaid_report(bildiriler, katilimcilar), file_name="Odenmemis_Bildiriler.xlsx", use_container_width=True, key="download_odenmemis_bildiriler")
+    c2.download_button("Sadece Fiziki Katılımcılar", data=make_katilim_turu_report(katilimcilar, "FİZİKİ"), file_name="Fiziki_Katilimcilar.xlsx", use_container_width=True, key="download_fiziki_katilimcilar")
 
     st.write("#### Yemek ve Etkinlik Listeleri")
     m1, m2, m3 = st.columns(3)
-    m1.download_button("07 Mayıs Öğle", data=make_meal_report(katilimcilar, ["7", "OGLE"]), file_name="07_Mayis_Ogle.xlsx", use_container_width=True)
-    m2.download_button("07 Mayıs Gala", data=make_meal_report(katilimcilar, ["GALA"]), file_name="07_Mayis_Gala.xlsx", use_container_width=True)
-    m3.download_button("08 Mayıs Öğle", data=make_meal_report(katilimcilar, ["8", "OGLE"]), file_name="08_Mayis_Ogle.xlsx", use_container_width=True)
+    m1.download_button("07 Mayıs Öğle", data=make_meal_report(katilimcilar, ["7", "OGLE"]), file_name="07_Mayis_Ogle.xlsx", use_container_width=True, key="download_07_ogle")
+    m2.download_button("07 Mayıs Gala", data=make_meal_report(katilimcilar, ["GALA"]), file_name="07_Mayis_Gala.xlsx", use_container_width=True, key="download_07_gala")
+    m3.download_button("08 Mayıs Öğle", data=make_meal_report(katilimcilar, ["8", "OGLE"]), file_name="08_Mayis_Ogle.xlsx", use_container_width=True, key="download_08_ogle")
 
     st.write("#### Zenginleştirilmiş Program")
     df_p = raw_data.get("program_plan", pd.DataFrame()).copy()
@@ -1709,9 +1710,9 @@ with tab_reports:
 
         df_enriched = pd.DataFrame(enriched_rows)
         filter_cols = st.columns(3)
-        secili_gun = filter_cols[0].multiselect("Gün", sorted({gun_key(x) for x in df_p["Gun_ve_Saat"].dropna().astype(str)}) if "Gun_ve_Saat" in df_p.columns else [])
-        secili_salon = filter_cols[1].multiselect("Salon", sorted(df_p["Salon"].dropna().unique()) if "Salon" in df_p.columns else [])
-        secili_tip = filter_cols[2].multiselect("Sunum tipi", sorted(df_p["Sunum_Tipi"].dropna().unique()) if "Sunum_Tipi" in df_p.columns else [])
+        secili_gun = filter_cols[0].multiselect("Gün", sorted({gun_key(x) for x in df_p["Gun_ve_Saat"].dropna().astype(str)}) if "Gun_ve_Saat" in df_p.columns else [], key="reports_program_gun_filter")
+        secili_salon = filter_cols[1].multiselect("Salon", sorted(df_p["Salon"].dropna().unique()) if "Salon" in df_p.columns else [], key="reports_program_salon_filter")
+        secili_tip = filter_cols[2].multiselect("Sunum tipi", sorted(df_p["Sunum_Tipi"].dropna().unique()) if "Sunum_Tipi" in df_p.columns else [], key="reports_program_tip_filter")
 
         df_filtered = df_enriched.copy()
         if "Gun_ve_Saat" in df_filtered.columns and secili_gun:
@@ -1723,7 +1724,7 @@ with tab_reports:
 
         out_prog = io.BytesIO()
         df_filtered.to_excel(out_prog, index=False)
-        st.download_button(f"Programı İndir ({len(df_filtered)} kayıt)", data=out_prog.getvalue(), file_name="Bildiri_Sunum_Programi_Zengin.xlsx", use_container_width=True)
+        st.download_button(f"Programı İndir ({len(df_filtered)} kayıt)", data=out_prog.getvalue(), file_name="Bildiri_Sunum_Programi_Zengin.xlsx", use_container_width=True, key="download_zengin_program")
 
 
 with tab_telegram:
