@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 import xlsxwriter
+from supabase import create_client
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -14,25 +15,6 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
 
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
-
-
-# =========================
-# AYARLAR
-# =========================
-
-DEFAULT_KATILIMCI_SHEET_ID = "1b6K9svdyT_RrgGCFsGYO5nrmPPYw6pkvO-BTzfwNT9k"
-DEFAULT_PROGRAM_SHEET_ID = "1Polxg5n-J0VueJifvjlgoGvXITVvnBbJpgSjHJ6imYY"
-
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
 
 PROGRAM_PLAN_INDEX = 0
 PROGRAM_BILDIRILER_SHEET = "Bildiriler"
@@ -41,12 +23,17 @@ PROGRAM_MOD_SHEET = "Moderatorler"
 
 
 # =========================
-# GENEL YARDIMCILAR
+# TEMIZLEME VE ESLESTIRME
 # =========================
 
 def safe_str(value) -> str:
-    if pd.isna(value):
+    if value is None:
         return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
     return str(value).strip()
 
 
@@ -131,7 +118,7 @@ def temiz_isim(isim):
 def unvan_bul(row, columns, raw_val):
     for col in columns:
         if "unvan" in str(col).lower():
-            u = str(row[col]).strip()
+            u = str(row.get(col, "")).strip()
             if u and u.lower() != "nan":
                 return u
     raw_upper = str(raw_val).upper()
@@ -152,23 +139,6 @@ def unvan_bul(row, columns, raw_val):
     if "ARŞ" in raw_upper or "ARS" in raw_upper:
         return "Arş. Gör."
     return ""
-
-
-def find_col(df: pd.DataFrame, candidates: List[str], contains: Optional[List[str]] = None) -> Optional[str]:
-    if df is None or df.empty:
-        return None
-    cols = list(df.columns)
-    normalized = {temiz_metin(str(c)): c for c in cols}
-    for cand in candidates:
-        key = temiz_metin(cand)
-        if key in normalized:
-            return normalized[key]
-    if contains:
-        for col in cols:
-            col_low = str(col).lower()
-            if all(x.lower() in col_low for x in contains):
-                return col
-    return None
 
 
 def parse_zaman(metin):
@@ -197,7 +167,6 @@ def clean_salon(sal):
     if isinstance(sal, pd.Timestamp) or hasattr(sal, "month"):
         if sal.month == 8 and sal.day == 30:
             return "30 Ağustos Salonu"
-
     n = str(sal).upper().strip()
     if "30 A" in n or "08-30" in n:
         return "30 Ağustos Salonu"
@@ -216,10 +185,26 @@ def clean_salon(sal):
     return str(sal).strip()
 
 
+def find_col(df: pd.DataFrame, candidates: List[str], contains: Optional[List[str]] = None) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    normalized = {temiz_metin(str(c)): c for c in df.columns}
+    for cand in candidates:
+        key = temiz_metin(cand)
+        if key in normalized:
+            return normalized[key]
+    if contains:
+        for col in df.columns:
+            col_low = str(col).lower()
+            if all(x.lower() in col_low for x in contains):
+                return col
+    return None
+
+
 def get_kisi_renk_emoji(k_data):
-    odeme = str(k_data.get("Odeme", "")).lower()
-    gorev = str(k_data.get("Gorev", "")).lower()
-    bildiri_sayisi = len(k_data.get("Bildiriler", []))
+    odeme = str(k_data.get("payment", "")).lower()
+    gorev = str(k_data.get("role", "")).lower()
+    bildiri_sayisi = len(k_data.get("submissions", []))
     if "muaf" in odeme or "görevli" in gorev or "davetli" in gorev:
         return "🟣"
     if "indirim" in odeme or "öğrenci" in odeme or "ogrenci" in odeme:
@@ -234,402 +219,533 @@ def get_kisi_renk_emoji(k_data):
 
 
 def get_bildiri_renk_emoji(b_data):
-    return "🟢" if b_data.get("Odeme") == "Evet" else "🟡"
-
-
-def get_program_info(b_isim, df_prog):
-    if df_prog is None or df_prog.empty:
-        return None
-    b_isim_temiz = super_temiz(b_isim)
-    for _, row in df_prog.iterrows():
-        row_vals = [str(x) for x in row.values if pd.notna(x)]
-        row_str = super_temiz(" ".join(row_vals))
-        if b_isim_temiz and b_isim_temiz in row_str:
-            parts = []
-            for key in ["Gun_ve_Saat", "Tarih", "Saat", "Salon", "Oturum_ID", "Sunum_Tipi"]:
-                if key in df_prog.columns and safe_str(row.get(key)):
-                    parts.append(f"{key}: {safe_str(row.get(key))}")
-            return " - ".join(parts) if parts else " | ".join(row_vals[:4])
-    return "Henüz program tablosunda yeri belli değil."
+    return "🟢" if b_data.get("payment") == "Evet" else "🟡"
 
 
 # =========================
-# GOOGLE SHEETS OKUMA/YAZMA
+# SUPABASE
 # =========================
 
-def has_service_account() -> bool:
-    try:
-        return bool(st.secrets.get("gcp_service_account"))
-    except Exception:
-        return False
-
-
-@st.cache_resource(show_spinner=False)
-def get_gspread_client():
-    if gspread is None or Credentials is None:
-        return None
-    if not has_service_account():
-        return None
-    info = dict(st.secrets["gcp_service_account"])
-    creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
-    return gspread.authorize(creds)
-
-
-def worksheet_to_df(ws) -> pd.DataFrame:
-    values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
-    headers = [str(h).strip() for h in values[0]]
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=headers).fillna("")
-    df["_row"] = list(range(2, len(df) + 2))
-    return df
-
-
-def read_ws_by_name(book, sheet_name: str) -> pd.DataFrame:
-    try:
-        return worksheet_to_df(book.worksheet(sheet_name))
-    except Exception:
-        return pd.DataFrame()
-
-
-def read_ws_by_index(book, index: int) -> pd.DataFrame:
-    try:
-        return worksheet_to_df(book.get_worksheet(index))
-    except Exception:
-        return pd.DataFrame()
-
-
-def public_excel_url(sheet_id: str) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-
-
-def read_public_sheet(sheet_id: str, sheet_name=None) -> pd.DataFrame:
-    xls = pd.ExcelFile(public_excel_url(sheet_id))
-    df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
-    if isinstance(df, dict):
-        return pd.DataFrame()
-    df.columns = [str(c).strip() for c in df.columns]
-    df["_row"] = list(range(2, len(df) + 2))
-    return df
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_all_data(katilimci_sheet_id: str, program_sheet_id: str, writable_mode: bool) -> Dict[str, pd.DataFrame]:
-    data = {}
-    client = get_gspread_client() if writable_mode else None
-
-    if client:
-        kat_book = client.open_by_key(katilimci_sheet_id)
-        prog_book = client.open_by_key(program_sheet_id)
-
-        data["program_plan"] = read_ws_by_index(prog_book, PROGRAM_PLAN_INDEX)
-        data["program_bildiriler"] = read_ws_by_name(prog_book, PROGRAM_BILDIRILER_SHEET)
-        data["ozel"] = read_ws_by_name(prog_book, PROGRAM_OZEL_SHEET)
-        data["mod"] = read_ws_by_name(prog_book, PROGRAM_MOD_SHEET)
-
-        data["bildiri_liste"] = read_ws_by_name(kat_book, "kabul edilen bildiriler")
-        data["odeme"] = read_ws_by_name(kat_book, "ödeme durumu")
-        data["bilgi"] = read_ws_by_name(kat_book, "katılımcı bilgileri")
-        data["anket"] = read_ws_by_name(kat_book, "katılımcıların ankete cevapları")
-        data["danisma"] = read_ws_by_name(kat_book, "Kongre Bilimsel Danışma Kurulu")
-        data["duzenleme"] = read_ws_by_name(kat_book, "Kongre Düzenleme Kurulu")
-        data["bildiri_detay"] = read_ws_by_name(kat_book, "bildirilerin detayları")
-        data["yaka_ek"] = read_ws_by_name(kat_book, "yaka kartı ek liste")
-        return data
-
-    # Sadece okuma modu: herkese açık export linkleri ile çalışır.
-    prog_xls = pd.ExcelFile(public_excel_url(program_sheet_id))
-    kat_xls = pd.ExcelFile(public_excel_url(katilimci_sheet_id))
-
-    def read_from_xls(xls, sheet_name):
+def get_secret(*names):
+    for name in names:
         try:
-            df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
-            df.columns = [str(c).strip() for c in df.columns]
-            df["_row"] = list(range(2, len(df) + 2))
-            return df
+            value = st.secrets.get(name)
+            if value:
+                return value
         except Exception:
-            return pd.DataFrame()
-
-    try:
-        df_plan = pd.read_excel(prog_xls, sheet_name=0, dtype=str).fillna("")
-        df_plan.columns = [str(c).strip() for c in df_plan.columns]
-        df_plan["_row"] = list(range(2, len(df_plan) + 2))
-        data["program_plan"] = df_plan
-    except Exception:
-        data["program_plan"] = pd.DataFrame()
-
-    data["program_bildiriler"] = read_from_xls(prog_xls, PROGRAM_BILDIRILER_SHEET)
-    data["ozel"] = read_from_xls(prog_xls, PROGRAM_OZEL_SHEET)
-    data["mod"] = read_from_xls(prog_xls, PROGRAM_MOD_SHEET)
-    data["bildiri_liste"] = read_from_xls(kat_xls, "kabul edilen bildiriler")
-    data["odeme"] = read_from_xls(kat_xls, "ödeme durumu")
-    data["bilgi"] = read_from_xls(kat_xls, "katılımcı bilgileri")
-    data["anket"] = read_from_xls(kat_xls, "katılımcıların ankete cevapları")
-    data["danisma"] = read_from_xls(kat_xls, "Kongre Bilimsel Danışma Kurulu")
-    data["duzenleme"] = read_from_xls(kat_xls, "Kongre Düzenleme Kurulu")
-    data["bildiri_detay"] = read_from_xls(kat_xls, "bildirilerin detayları")
-    data["yaka_ek"] = read_from_xls(kat_xls, "yaka kartı ek liste")
-    return data
-
-
-def get_worksheet(sheet_id: str, sheet_name_or_index):
-    client = get_gspread_client()
-    if not client:
-        raise RuntimeError("Google Sheets yazma için Streamlit secrets içine gcp_service_account eklenmeli.")
-    book = client.open_by_key(sheet_id)
-    if isinstance(sheet_name_or_index, int):
-        return book.get_worksheet(sheet_name_or_index)
-    return book.worksheet(sheet_name_or_index)
-
-
-def update_sheet_row(sheet_id: str, sheet_name_or_index, row_number: int, updates: Dict[str, str]):
-    ws = get_worksheet(sheet_id, sheet_name_or_index)
-    headers = [h.strip() for h in ws.row_values(1)]
-    header_map = {h: i + 1 for i, h in enumerate(headers)}
-    missing = [col for col in updates if col not in header_map]
-    if missing:
-        raise ValueError(f"Sheet içinde şu kolonlar bulunamadı: {', '.join(missing)}")
-
-    payload = []
-    for col_name, value in updates.items():
-        a1 = gspread.utils.rowcol_to_a1(row_number, header_map[col_name])
-        payload.append({"range": a1, "values": [[value]]})
-    ws.batch_update(payload, value_input_option="USER_ENTERED")
-
-
-def find_row_by_value(sheet_id: str, sheet_name_or_index, col_name: str, target_value: str) -> Optional[int]:
-    ws = get_worksheet(sheet_id, sheet_name_or_index)
-    values = ws.get_all_values()
-    if not values:
-        return None
-    headers = [h.strip() for h in values[0]]
-    if col_name not in headers:
-        return None
-    col_idx = headers.index(col_name)
-    target = temiz_metin(target_value)
-    for i, row in enumerate(values[1:], start=2):
-        val = row[col_idx] if col_idx < len(row) else ""
-        if temiz_metin(val) == target:
-            return i
+            pass
     return None
 
 
+@st.cache_resource(show_spinner=False)
+def get_supabase():
+    url = get_secret("SUPABASE_URL", "supabase_url")
+    key = get_secret("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY", "supabase_key")
+    if not url or not key:
+        return None
+    return create_client(url, key)
+
+
+def sb():
+    client = get_supabase()
+    if client is None:
+        st.error("Supabase ayarları eksik. Streamlit Secrets içine SUPABASE_URL ve SUPABASE_SERVICE_ROLE_KEY ekle.")
+        st.stop()
+    return client
+
+
+def fetch_all(table: str, order: Optional[str] = None) -> List[dict]:
+    client = sb()
+    rows = []
+    start = 0
+    step = 1000
+    while True:
+        query = client.table(table).select("*")
+        if order:
+            query = query.order(order)
+        result = query.range(start, start + step - 1).execute()
+        chunk = result.data or []
+        rows.extend(chunk)
+        if len(chunk) < step:
+            break
+        start += step
+    return rows
+
+
+def df_from_table(table: str, order: Optional[str] = None) -> pd.DataFrame:
+    return pd.DataFrame(fetch_all(table, order=order))
+
+
+def insert_batches(table: str, records: List[dict], batch_size: int = 500):
+    if not records:
+        return
+    client = sb()
+    for i in range(0, len(records), batch_size):
+        client.table(table).insert(records[i : i + batch_size]).execute()
+
+
+def update_by_id(table: str, row_id: int, values: Dict):
+    sb().table(table).update(values).eq("id", row_id).execute()
+
+
+def delete_all_data():
+    client = sb()
+    for table in ["submission_authors", "special_events", "moderators", "submissions", "participants"]:
+        client.table(table).delete().neq("id", 0).execute()
+
+
 # =========================
-# VERİ MODELİ
+# EXCEL ICERI AKTARMA
 # =========================
 
-def build_database(raw_data: Dict[str, pd.DataFrame]) -> Tuple[Dict, Dict]:
-    bildiriler = {}
-    katilimcilar = {}
+def read_xls(uploaded_file):
+    if uploaded_file is None:
+        return None
+    return pd.ExcelFile(io.BytesIO(uploaded_file.getvalue()))
+
+
+def read_sheet(xls, sheet_name, default_index=None):
+    if xls is None:
+        return pd.DataFrame()
+    try:
+        if default_index is not None:
+            df = pd.read_excel(xls, sheet_name=default_index, dtype=str).fillna("")
+        else:
+            df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
+        df.columns = [str(c).strip() for c in df.columns]
+        df["_row"] = list(range(2, len(df) + 2))
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def merge_participant(participants: Dict[str, dict], name, title="", physical=False, role="Yok", payment="Ödeme Bekleniyor"):
+    norm = temiz_isim(str(name))
+    if not norm:
+        return
+    if norm not in participants:
+        participants[norm] = {
+            "norm_name": norm,
+            "original_name": turkce_buyuk(str(name)),
+            "title": title,
+            "email": "",
+            "phone": "",
+            "institution": "",
+            "role": role,
+            "payment": payment,
+            "attendance_type": "Fiziki" if physical else "Belirtilmedi",
+            "intent": "Hayır",
+            "days": {"6": "", "7": "", "8": ""},
+            "events": "",
+        }
+    if title:
+        participants[norm]["title"] = title
+    if role and role != "Yok":
+        participants[norm]["role"] = role
+    if payment and payment != "Ödeme Bekleniyor":
+        participants[norm]["payment"] = payment
+    if physical:
+        participants[norm]["attendance_type"] = "Fiziki"
+
+
+def build_import_payload(katilimci_xls, program_xls):
+    program_plan = read_sheet(program_xls, None, default_index=PROGRAM_PLAN_INDEX)
+    program_bildiriler = read_sheet(program_xls, PROGRAM_BILDIRILER_SHEET)
+    special_events_df = read_sheet(program_xls, PROGRAM_OZEL_SHEET)
+    moderators_df = read_sheet(program_xls, PROGRAM_MOD_SHEET)
+
+    bildiri_liste = read_sheet(katilimci_xls, "kabul edilen bildiriler")
+    odeme_df = read_sheet(katilimci_xls, "ödeme durumu")
+    bilgi_df = read_sheet(katilimci_xls, "katılımcı bilgileri")
+    anket_df = read_sheet(katilimci_xls, "katılımcıların ankete cevapları")
+    danisma_df = read_sheet(katilimci_xls, "Kongre Bilimsel Danışma Kurulu")
+    duzenleme_df = read_sheet(katilimci_xls, "Kongre Düzenleme Kurulu")
+    detay_df = read_sheet(katilimci_xls, "bildirilerin detayları")
+    yaka_df = read_sheet(katilimci_xls, "yaka kartı ek liste")
+
+    if program_bildiriler.empty:
+        program_bildiriler = bildiri_liste.copy()
+
+    participants = {}
+    submissions = {}
+    author_links = []
+
     detay_map = {}
-
-    df_detay = raw_data.get("bildiri_detay", pd.DataFrame())
-    for _, row in df_detay.iterrows():
+    for _, row in detay_df.iterrows():
         b_adi = ""
-        for col in df_detay.columns:
+        for col in detay_df.columns:
             if "bildiri" in str(col).lower() and ("ad" in str(col).lower() or "ism" in str(col).lower()):
-                b_adi = str(row[col]).strip()
+                b_adi = safe_str(row.get(col))
                 break
         if b_adi:
             b_key = temiz_metin(b_adi)
             detay_map[b_key] = {
-                "Konu": str(row.get("Konu", "")),
-                "Butik": "Evet" if "evet" in str(row.get("Butik Bildiri", "")).lower() else "",
+                "topic": safe_str(row.get("Konu")) or "-",
+                "boutique": "Evet" if "evet" in safe_str(row.get("Butik Bildiri")).lower() else "",
             }
 
-    df_bildiri = raw_data.get("program_bildiriler")
-    if df_bildiri is None or df_bildiri.empty:
-        df_bildiri = raw_data.get("bildiri_liste", pd.DataFrame())
-
-    b_col = find_col(df_bildiri, ["Bildiri Ismi", "Bildiri_Adi", "Bildiri Adı"], contains=["bildiri"])
-    sun_col = find_col(df_bildiri, ["Sunan Yazar", "sunucu", "Sunucu"], contains=["sunan"])
-
-    for _, row in df_bildiri.iterrows():
-        b_adi_orijinal = str(row.get(b_col, "")).strip() if b_col else ""
-        if b_adi_orijinal:
-            b_key = temiz_metin(b_adi_orijinal)
-            sunucu = temiz_isim(str(row.get(sun_col, ""))) if sun_col else ""
-            if b_key not in bildiriler:
-                bildiriler[b_key] = {
-                    "Orijinal İsim": b_adi_orijinal,
-                    "Konu": detay_map.get(b_key, {}).get("Konu", str(row.get("Konu", "-"))),
-                    "Butik": detay_map.get(b_key, {}).get("Butik", ""),
-                    "Kabul": "Evet",
-                    "Yazarlar": [],
-                    "Sunucu": sunucu,
-                    "Odeme": "Hayır",
-                }
-            for i in range(1, 9):
-                y = temiz_isim(str(row.get(f"Yazar {i}", "")))
-                if y and y not in bildiriler[b_key]["Yazarlar"]:
-                    bildiriler[b_key]["Yazarlar"].append(y)
-            if sunucu and sunucu not in bildiriler[b_key]["Yazarlar"]:
-                bildiriler[b_key]["Yazarlar"].append(sunucu)
-
-    def kisi_islet(isim, unvan="", fiziki=False, gorev="Yok", odeme="Ödeme Bekleniyor"):
-        t = temiz_isim(isim)
-        if not t:
-            return
-        if t not in katilimcilar:
-            katilimcilar[t] = {
-                "Orijinal İsim": turkce_buyuk(isim),
-                "Unvan": unvan,
-                "E-Posta": "",
-                "Telefon": "",
-                "Kurum": "",
-                "Gorev": gorev,
-                "Odeme": odeme,
-                "Tur": "Fiziki" if fiziki else "Belirtilmedi",
-                "Niyet": "Hayır",
-                "Gunler": {"6": "", "7": "", "8": ""},
-                "Etkinlikler": "",
-                "Bildiriler": [],
-            }
-        if unvan:
-            katilimcilar[t]["Unvan"] = unvan
-        if gorev != "Yok":
-            katilimcilar[t]["Gorev"] = gorev
-        if odeme != "Ödeme Bekleniyor":
-            katilimcilar[t]["Odeme"] = odeme
-
-    for sheet_key, gorev in [
-        ("danisma", "Görevli - Bilimsel Danışma Kurulu"),
-        ("duzenleme", "Görevli - Kongre Düzenleme Kurulu"),
+    for sheet_df, role in [
+        (danisma_df, "Görevli - Bilimsel Danışma Kurulu"),
+        (duzenleme_df, "Görevli - Kongre Düzenleme Kurulu"),
     ]:
-        df = raw_data.get(sheet_key, pd.DataFrame())
-        for _, r in df.iterrows():
-            isim = str(r.iloc[0]).strip() if len(r) else ""
-            unv = unvan_bul(r, df.columns, isim)
-            kisi_islet(isim, unvan=unv, gorev=gorev, odeme="Görevli/Davetli (Muaf)", fiziki=True)
-
-    df_yaka = raw_data.get("yaka_ek", pd.DataFrame())
-    for _, r in df_yaka.iterrows():
-        if len(r) >= 2:
-            kisi_islet(
-                str(r.iloc[1]).strip(),
-                unvan=str(r.iloc[0]).strip(),
-                gorev=str(r.iloc[2]).strip() if len(r) > 2 else "Davetli Katılımcı",
-                odeme="Görevli/Davetli (Muaf)",
-                fiziki=True,
+        for _, r in sheet_df.iterrows():
+            isim = safe_str(r.iloc[0]) if len(r) else ""
+            merge_participant(
+                participants,
+                isim,
+                title=unvan_bul(r, sheet_df.columns, isim),
+                role=role,
+                payment="Görevli/Davetli (Muaf)",
+                physical=True,
             )
 
-    df_odeme = raw_data.get("odeme", pd.DataFrame())
-    for _, r in df_odeme.iterrows():
+    for _, r in yaka_df.iterrows():
         if len(r) >= 2:
-            kisi_islet(r.iloc[0], odeme=str(r.iloc[1]))
+            merge_participant(
+                participants,
+                safe_str(r.iloc[1]),
+                title=safe_str(r.iloc[0]),
+                role=safe_str(r.iloc[2]) if len(r) > 2 else "Davetli Katılımcı",
+                payment="Görevli/Davetli (Muaf)",
+                physical=True,
+            )
 
-    df_bilgi = raw_data.get("bilgi", pd.DataFrame())
-    for _, r in df_bilgi.iterrows():
-        ad_soy = str(r.get("Adı Soyadı", r.iloc[0] if len(r) else "")).strip()
-        t = temiz_isim(ad_soy)
-        if t in katilimcilar:
-            for c in df_bilgi.columns:
+    for _, r in odeme_df.iterrows():
+        if len(r) >= 2:
+            merge_participant(participants, safe_str(r.iloc[0]), payment=safe_str(r.iloc[1]))
+
+    for _, r in bilgi_df.iterrows():
+        ad_soy = safe_str(r.get("Adı Soyadı", r.iloc[0] if len(r) else ""))
+        norm = temiz_isim(ad_soy)
+        if norm in participants:
+            for c in bilgi_df.columns:
                 cl = str(c).lower()
-                val = str(r[c]).strip()
-                if val and val.lower() != "nan":
-                    if "mail" in cl or "posta" in cl:
-                        katilimcilar[t]["E-Posta"] = val
-                    elif "telefon" in cl or "gsm" in cl:
-                        katilimcilar[t]["Telefon"] = val
-                    elif "kurum" in cl or "üniversite" in cl:
-                        katilimcilar[t]["Kurum"] = val
+                val = safe_str(r.get(c))
+                if not val:
+                    continue
+                if "mail" in cl or "posta" in cl:
+                    participants[norm]["email"] = val
+                elif "telefon" in cl or "gsm" in cl:
+                    participants[norm]["phone"] = val
+                elif "kurum" in cl or "üniversite" in cl:
+                    participants[norm]["institution"] = val
 
-    df_anket = raw_data.get("anket", pd.DataFrame())
-    for _, r in df_anket.iterrows():
-        ad = str(r.get("Adı Soyadı", r.iloc[0] if len(r) else "")).strip()
-        t = temiz_isim(ad)
-        if not t:
+    for _, r in anket_df.iterrows():
+        ad = safe_str(r.get("Adı Soyadı", r.iloc[0] if len(r) else ""))
+        norm = temiz_isim(ad)
+        if not norm:
             continue
-        unv = unvan_bul(r, df_anket.columns, ad)
-        kisi_islet(ad, unvan=unv)
-        for c in df_anket.columns:
+        merge_participant(participants, ad, title=unvan_bul(r, anket_df.columns, ad))
+        for c in anket_df.columns:
             cl = str(c).lower()
-            val = str(r[c])
-            if val.lower() == "nan" or not val:
+            val = safe_str(r.get(c))
+            if not val:
                 continue
             if "nasıl katılım" in cl:
-                katilimcilar[t]["Tur"] = val
+                participants[norm]["attendance_type"] = val
             elif "6 mayıs" in cl:
-                katilimcilar[t]["Gunler"]["6"] = val
+                participants[norm]["days"]["6"] = val
             elif "7 mayıs" in cl:
-                katilimcilar[t]["Gunler"]["7"] = val
+                participants[norm]["days"]["7"] = val
             elif "8 mayıs" in cl:
-                katilimcilar[t]["Gunler"]["8"] = val
+                participants[norm]["days"]["8"] = val
             elif "etkinlik" in cl:
-                katilimcilar[t]["Etkinlikler"] += ", " + val
+                participants[norm]["events"] += ", " + val
             elif "sunacaksanız" in cl and "katılımcı" not in val.lower():
-                katilimcilar[t]["Niyet"] = "Evet"
+                participants[norm]["intent"] = "Evet"
 
-    for b_key, b_v in bildiriler.items():
-        bildiri_odendi = False
-        for y in b_v["Yazarlar"]:
-            if y not in katilimcilar:
-                kisi_islet(y)
-            if b_v["Orijinal İsim"] not in katilimcilar[y]["Bildiriler"]:
-                katilimcilar[y]["Bildiriler"].append(b_v["Orijinal İsim"])
-            odeme = str(katilimcilar[y]["Odeme"])
-            if "Bekleniyor" not in odeme and "Yok" not in odeme:
-                bildiri_odendi = True
-        if bildiri_odendi:
-            bildiriler[b_key]["Odeme"] = "Evet"
+    schedule_map = {}
+    if not program_plan.empty:
+        title_col = find_col(program_plan, ["Bildiri_Adi", "Bildiri Adı", "Bildiri Ismi"], contains=["bildiri"])
+        for _, row in program_plan.iterrows():
+            title = safe_str(row.get(title_col)) if title_col else ""
+            norm_title = temiz_metin(title)
+            if not norm_title:
+                continue
+            schedule_map[norm_title] = {
+                "title": title,
+                "presentation_type": safe_str(row.get("Sunum_Tipi")),
+                "session_time": safe_str(row.get("Gun_ve_Saat")),
+                "hall": safe_str(row.get("Salon")),
+                "session_id": safe_str(row.get("Oturum_ID")),
+                "source_row": int(row.get("_row", 0) or 0),
+            }
 
-    for _, v in katilimcilar.items():
-        if v["Odeme"] == "Ödeme Bekleniyor" and len(v["Bildiriler"]) == 0:
-            v["Odeme"] = "Bildirisi Yok / Kayıt Yok"
+    b_col = find_col(program_bildiriler, ["Bildiri Ismi", "Bildiri_Adi", "Bildiri Adı"], contains=["bildiri"])
+    presenter_col = find_col(program_bildiriler, ["Sunan Yazar", "sunucu", "Sunucu"], contains=["sunan"])
+    topic_col = find_col(program_bildiriler, ["Konu"], contains=["konu"])
 
+    for _, row in program_bildiriler.iterrows():
+        title = safe_str(row.get(b_col)) if b_col else ""
+        norm_title = temiz_metin(title)
+        if not norm_title:
+            continue
+        presenter_norm = temiz_isim(safe_str(row.get(presenter_col))) if presenter_col else ""
+        authors = []
+        for i in range(1, 9):
+            author_norm = temiz_isim(safe_str(row.get(f"Yazar {i}")))
+            if author_norm and author_norm not in authors:
+                authors.append(author_norm)
+                merge_participant(participants, author_norm)
+        if presenter_norm and presenter_norm not in authors:
+            authors.append(presenter_norm)
+            merge_participant(participants, presenter_norm)
+
+        sched = schedule_map.get(norm_title, {})
+        submissions[norm_title] = {
+            "norm_title": norm_title,
+            "title": title,
+            "topic": detay_map.get(norm_title, {}).get("topic") or (safe_str(row.get(topic_col)) if topic_col else "-") or "-",
+            "boutique": detay_map.get(norm_title, {}).get("boutique", ""),
+            "accepted": "Evet",
+            "presenter_norm_name": presenter_norm,
+            "payment": "Hayır",
+            "presentation_type": sched.get("presentation_type", ""),
+            "session_time": sched.get("session_time", ""),
+            "hall": sched.get("hall", ""),
+            "session_id": sched.get("session_id", ""),
+            "source_row": sched.get("source_row"),
+            "_authors": authors,
+        }
+
+    for norm_title, sched in schedule_map.items():
+        if norm_title not in submissions:
+            submissions[norm_title] = {
+                "norm_title": norm_title,
+                "title": sched["title"],
+                "topic": detay_map.get(norm_title, {}).get("topic", "-"),
+                "boutique": detay_map.get(norm_title, {}).get("boutique", ""),
+                "accepted": "Evet",
+                "presenter_norm_name": "",
+                "payment": "Hayır",
+                "presentation_type": sched.get("presentation_type", ""),
+                "session_time": sched.get("session_time", ""),
+                "hall": sched.get("hall", ""),
+                "session_id": sched.get("session_id", ""),
+                "source_row": sched.get("source_row"),
+                "_authors": [],
+            }
+
+    for sub in submissions.values():
+        paid = False
+        for author_norm in sub["_authors"]:
+            payment = participants.get(author_norm, {}).get("payment", "Ödeme Bekleniyor")
+            if "Bekleniyor" not in payment and "Yok" not in payment:
+                paid = True
+        sub["payment"] = "Evet" if paid else "Hayır"
+
+    for norm, participant in participants.items():
+        if participant["payment"] == "Ödeme Bekleniyor":
+            has_submission = any(norm in sub["_authors"] for sub in submissions.values())
+            if not has_submission:
+                participant["payment"] = "Bildirisi Yok / Kayıt Yok"
+
+    participant_records = list(participants.values())
+    submission_records = []
+    authors_by_submission = {}
+    for norm_title, sub in submissions.items():
+        authors_by_submission[norm_title] = sub.pop("_authors")
+        submission_records.append(sub)
+
+    moderator_records = []
+    for _, r in moderators_df.iterrows():
+        if not any(safe_str(x) for x in r.values):
+            continue
+        online_raw = safe_str(r.get("Online")).lower()
+        moderator_records.append(
+            {
+                "name": safe_str(r.get("unvan_ad_soyad")),
+                "institution": safe_str(r.get("kurum")),
+                "duty": safe_str(r.get("Gorev")) or "Moderator",
+                "session_time": safe_str(r.get("Gun_ve_Saat")),
+                "hall": safe_str(r.get("Salon")),
+                "session_id": safe_str(r.get("Oturum_ID")),
+                "online": online_raw in ["evet", "e", "yes", "1", "true", "online"],
+                "source_row": int(r.get("_row", 0) or 0),
+            }
+        )
+
+    special_event_records = []
+    for _, r in special_events_df.iterrows():
+        if not any(safe_str(x) for x in r.values):
+            continue
+        special_event_records.append(
+            {
+                "event_order": safe_str(r.get("oturum_sirasi")),
+                "hall": safe_str(r.get("salon")),
+                "datetime_text": safe_str(r.get("tarih_saat")),
+                "main_title": safe_str(r.get("ana_baslik")),
+                "subtitle": safe_str(r.get("alt_baslik")),
+                "left_text": safe_str(r.get("sol_metin")),
+                "right_text": safe_str(r.get("sag_metin")),
+            }
+        )
+
+    return participant_records, submission_records, authors_by_submission, moderator_records, special_event_records
+
+
+def import_excel_to_supabase(katilimci_file, program_file):
+    katilimci_xls = read_xls(katilimci_file)
+    program_xls = read_xls(program_file) if program_file is not None else katilimci_xls
+    (
+        participant_records,
+        submission_records,
+        authors_by_submission,
+        moderator_records,
+        special_event_records,
+    ) = build_import_payload(katilimci_xls, program_xls)
+
+    delete_all_data()
+    insert_batches("participants", participant_records)
+    insert_batches("submissions", submission_records)
+    insert_batches("moderators", moderator_records)
+    insert_batches("special_events", special_event_records)
+
+    participants_df = df_from_table("participants")
+    submissions_df = df_from_table("submissions")
+    p_id = {row["norm_name"]: row["id"] for _, row in participants_df.iterrows()}
+    s_id = {row["norm_title"]: row["id"] for _, row in submissions_df.iterrows()}
+
+    link_records = []
+    for norm_title, authors in authors_by_submission.items():
+        if norm_title not in s_id:
+            continue
+        for order, author_norm in enumerate(authors, start=1):
+            display_name = participants_df.loc[participants_df["norm_name"] == author_norm, "original_name"]
+            link_records.append(
+                {
+                    "submission_id": int(s_id[norm_title]),
+                    "participant_id": int(p_id[author_norm]) if author_norm in p_id else None,
+                    "author_order": order,
+                    "norm_name": author_norm,
+                    "display_name": display_name.iloc[0] if not display_name.empty else turkce_buyuk(author_norm),
+                }
+            )
+    insert_batches("submission_authors", link_records)
+
+    return {
+        "participants": len(participant_records),
+        "submissions": len(submission_records),
+        "authors": len(link_records),
+        "moderators": len(moderator_records),
+        "special_events": len(special_event_records),
+    }
+
+
+# =========================
+# DB SNAPSHOT VE SORGULAR
+# =========================
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_snapshot():
+    return {
+        "participants": df_from_table("participants", order="original_name"),
+        "submissions": df_from_table("submissions", order="session_time"),
+        "authors": df_from_table("submission_authors", order="author_order"),
+        "moderators": df_from_table("moderators", order="session_time"),
+        "special_events": df_from_table("special_events", order="event_order"),
+    }
+
+
+def build_lookup(snapshot):
+    participants_df = snapshot["participants"]
+    submissions_df = snapshot["submissions"]
+    authors_df = snapshot["authors"]
+    katilimcilar = {}
+    bildiriler = {}
+
+    for _, p in participants_df.iterrows():
+        katilimcilar[p["norm_name"]] = p.to_dict()
+        katilimcilar[p["norm_name"]]["submissions"] = []
+
+    for _, s in submissions_df.iterrows():
+        sub_authors = authors_df[authors_df["submission_id"] == s["id"]].sort_values("author_order")
+        authors = list(sub_authors["norm_name"]) if not sub_authors.empty else []
+        d = s.to_dict()
+        d["authors"] = authors
+        bildiriler[s["norm_title"]] = d
+        for author_norm in authors:
+            if author_norm in katilimcilar:
+                katilimcilar[author_norm]["submissions"].append(s["title"])
     return bildiriler, katilimcilar
 
 
-def build_matbaa_master(raw_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    df_ayar = raw_data.get("program_plan", pd.DataFrame()).copy().fillna("-")
-    df_bildiriler = raw_data.get("program_bildiriler", pd.DataFrame()).copy().fillna("-")
-    if df_bildiriler.empty:
-        df_bildiriler = raw_data.get("bildiri_liste", pd.DataFrame()).copy().fillna("-")
+def df_master_from_snapshot(snapshot):
+    submissions_df = snapshot["submissions"]
+    authors_df = snapshot["authors"]
+    rows = []
+    for _, s in submissions_df.iterrows():
+        sub_authors = authors_df[authors_df["submission_id"] == s["id"]].sort_values("author_order")
+        yazarlar = " - ".join([safe_str(x) for x in sub_authors["display_name"]]) if not sub_authors.empty else ""
+        presenter_norm = safe_str(s.get("presenter_norm_name"))
+        presenter_display = ""
+        if presenter_norm and not sub_authors.empty:
+            match = sub_authors[sub_authors["norm_name"] == presenter_norm]
+            if not match.empty:
+                presenter_display = safe_str(match.iloc[0]["display_name"])
+        if not presenter_display:
+            presenter_display = presenter_norm
+        rows.append(
+            {
+                "id": int(s["id"]),
+                "Bildiri_Adi": safe_str(s.get("title")),
+                "Gun_ve_Saat": safe_str(s.get("session_time")),
+                "Salon": safe_str(s.get("hall")),
+                "Oturum_ID": safe_str(s.get("session_id")),
+                "Sunum_Tipi": safe_str(s.get("presentation_type")),
+                "yazarlar": yazarlar,
+                "sunucu": presenter_display,
+                "konu": safe_str(s.get("topic")) or "-",
+            }
+        )
+    return pd.DataFrame(rows)
 
-    for df in [df_ayar, df_bildiriler]:
-        df.columns = [str(c).strip() for c in df.columns]
 
-    yazar_sutunlari = [f"Yazar {i}" for i in range(1, 9)]
-    for col in yazar_sutunlari:
-        if col not in df_bildiriler.columns:
-            df_bildiriler[col] = "-"
-
-    isim_col = find_col(df_bildiriler, ["Bildiri Ismi", "Bildiri_Adi", "Bildiri Adı"], contains=["bildiri"])
-    sunan_col = find_col(df_bildiriler, ["Sunan Yazar", "sunucu", "Sunucu"], contains=["sunan"])
-    konu_col = find_col(df_bildiriler, ["Konu"], contains=["konu"])
-
-    if isim_col is None:
+def moderators_df_for_matbaa(snapshot):
+    df = snapshot["moderators"].copy()
+    if df.empty:
         return pd.DataFrame()
-
-    df_bildiriler["yazarlar"] = df_bildiriler.apply(
-        lambda r: " - ".join([str(r[c]).strip() for c in yazar_sutunlari if str(r[c]).strip() not in ["-", ""]]),
-        axis=1,
+    return pd.DataFrame(
+        {
+            "unvan_ad_soyad": df.get("name", ""),
+            "kurum": df.get("institution", ""),
+            "Gorev": df.get("duty", ""),
+            "Gun_ve_Saat": df.get("session_time", ""),
+            "Salon": df.get("hall", ""),
+            "Oturum_ID": df.get("session_id", ""),
+            "Online": df.get("online", False).apply(lambda x: "Evet" if bool(x) else "Hayır"),
+        }
     )
-    df_bildiriler["etkinlik_adi"] = df_bildiriler[isim_col].astype(str).str.strip()
-    df_bildiriler["sunucu"] = df_bildiriler[sunan_col].astype(str).str.strip() if sunan_col else "-"
-    df_bildiriler["konu"] = df_bildiriler[konu_col].astype(str).str.strip() if konu_col else "-"
-    df_bildiriler = df_bildiriler.drop_duplicates(subset=["etkinlik_adi"])
 
-    if "Bildiri_Adi" not in df_ayar.columns:
-        possible = find_col(df_ayar, ["Bildiri_Adi", "Bildiri Adı", "Bildiri Ismi"], contains=["bildiri"])
-        if possible:
-            df_ayar["Bildiri_Adi"] = df_ayar[possible]
-        else:
-            return pd.DataFrame()
 
-    df_ayar["Bildiri_Adi"] = df_ayar["Bildiri_Adi"].astype(str).str.strip()
-    df_master = pd.merge(
-        df_ayar,
-        df_bildiriler[["etkinlik_adi", "yazarlar", "sunucu", "konu"]],
-        left_on="Bildiri_Adi",
-        right_on="etkinlik_adi",
-        how="left",
-    ).fillna("-")
-    for col in ["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi", "Bildiri_Adi", "sunucu", "yazarlar", "konu"]:
-        if col not in df_master.columns:
-            df_master[col] = "-"
-    return df_master
+def special_events_df_for_matbaa(snapshot):
+    df = snapshot["special_events"].copy()
+    if df.empty:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        {
+            "oturum_sirasi": df.get("event_order", ""),
+            "salon": df.get("hall", ""),
+            "tarih_saat": df.get("datetime_text", ""),
+            "ana_baslik": df.get("main_title", ""),
+            "alt_baslik": df.get("subtitle", ""),
+            "sol_metin": df.get("left_text", ""),
+            "sag_metin": df.get("right_text", ""),
+        }
+    )
+
+
+def program_info(sub):
+    parts = []
+    if safe_str(sub.get("presentation_type")):
+        parts.append(safe_str(sub.get("presentation_type")))
+    if safe_str(sub.get("session_time")):
+        parts.append(safe_str(sub.get("session_time")))
+    if safe_str(sub.get("hall")):
+        parts.append(safe_str(sub.get("hall")))
+    if safe_str(sub.get("session_id")):
+        parts.append(safe_str(sub.get("session_id")))
+    return " | ".join(parts) if parts else "Henüz programda yeri belli değil."
 
 
 # =========================
@@ -663,20 +779,24 @@ def add_merged_row(table, text, bg_color, text_color=(0, 0, 0), bold=False, alig
 
 def build_program_dict(df_bildiriler):
     prog = {}
+    if df_bildiriler.empty:
+        return prog
     for _, r in df_bildiriler.iterrows():
-        b_adi = str(r["Bildiri_Adi"])
-        sunucu = str(r["sunucu"])
-        yazarlar = str(r["yazarlar"])
-        konu = str(r["konu"])
-        kz = str(r["Gun_ve_Saat"]).replace("Persembe", "Perşembe")
-        ks = clean_salon(r["Salon"])
-        sid = str(r["Oturum_ID"])
-        if kz in ["", "-", "nan", "NaN"] or b_adi in ["", "-", "nan", "NaN"]:
+        b_adi = safe_str(r.get("Bildiri_Adi"))
+        kz = safe_str(r.get("Gun_ve_Saat")).replace("Persembe", "Perşembe")
+        if not b_adi or not kz:
             continue
-        anahtar = (kz, ks)
-        if anahtar not in prog:
-            prog[anahtar] = []
-        prog[anahtar].append({"b": b_adi, "y": yazarlar, "s": sunucu, "k": konu, "sid": sid})
+        ks = clean_salon(r.get("Salon"))
+        key = (kz, ks)
+        prog.setdefault(key, []).append(
+            {
+                "b": b_adi,
+                "y": safe_str(r.get("yazarlar")),
+                "s": safe_str(r.get("sunucu")),
+                "k": safe_str(r.get("konu")) or "-",
+                "sid": safe_str(r.get("Oturum_ID")),
+            }
+        )
     return prog
 
 
@@ -692,61 +812,45 @@ def moderator_atamalari_olustur(prog, df_mod, tip):
     serbest_mods, serbest_degs = [], []
 
     for _, r in df_mod.iterrows():
-        is_online_mod = str(r.get("Online", "-")).strip().lower() in [
-            "evet",
-            "e",
-            "yes",
-            "1",
-            "var",
-            "online",
-            "true",
-        ]
+        is_online_mod = safe_str(r.get("Online")).lower() in ["evet", "e", "yes", "1", "var", "online", "true"]
         if tip == "ONLINE" and not is_online_mod:
             continue
         if tip == "YUZYUZE" and is_online_mod:
             continue
-
-        m_gun_saat = str(r.get("Gun_ve_Saat", "-")).strip().replace("Persembe", "Perşembe")
-        m_salon_ham = str(r.get("Salon", "-")).strip()
+        m_gun_saat = safe_str(r.get("Gun_ve_Saat")).replace("Persembe", "Perşembe")
+        m_salon_ham = safe_str(r.get("Salon"))
         m_salon = clean_salon(m_salon_ham) if m_salon_ham != "-" else "-"
-        m_oturum = str(r.get("Oturum_ID", "-")).strip()
-        gorev_sutunu = str(r.get("Gorev", "-")).strip().lower()
-        kurum = str(r.get("kurum", "-"))
-        mod_metni = (
-            f"{r.get('unvan_ad_soyad', '-')} ({r.get('kurum', '')})"
-            if kurum not in ["-", "nan", ""]
-            else str(r.get("unvan_ad_soyad", "-"))
-        )
-
+        m_oturum = safe_str(r.get("Oturum_ID")) or "-"
+        gorev_sutunu = safe_str(r.get("Gorev")).lower()
+        kurum = safe_str(r.get("kurum"))
+        mod_metni = f"{safe_str(r.get('unvan_ad_soyad'))} ({kurum})" if kurum else safe_str(r.get("unvan_ad_soyad"))
         is_deg = "deg" in gorev_sutunu
         role_key = "deg" if is_deg else "mod"
-        hedef_musait_liste = musait_oturumlar_deg if is_deg else musait_oturumlar_mod
-        hedef_serbest_liste = serbest_degs if is_deg else serbest_mods
+        hedef_musait = musait_oturumlar_deg if is_deg else musait_oturumlar_mod
+        hedef_serbest = serbest_degs if is_deg else serbest_mods
 
         atandi_mi = False
-        if m_gun_saat != "-" and m_salon != "-":
+        if m_gun_saat and m_gun_saat != "-" and m_salon and m_salon != "-":
             hedef_tuple = (m_gun_saat, m_salon)
-            if hedef_tuple in hedef_musait_liste:
+            if hedef_tuple in hedef_musait:
                 mod_atamalari[hedef_tuple][role_key] = mod_metni
-                hedef_musait_liste.remove(hedef_tuple)
+                hedef_musait.remove(hedef_tuple)
                 atandi_mi = True
 
         if not atandi_mi and (m_gun_saat != "-" or m_salon != "-" or m_oturum != "-"):
-            for sess in list(hedef_musait_liste):
-                zaman_metni = sess[0]
-                salon_metni = sess[1]
+            for sess in list(hedef_musait):
                 oturum_id_metni = prog[sess][0]["sid"] if prog[sess] else "-"
                 if (
-                    (m_gun_saat == "-" or m_gun_saat in zaman_metni)
-                    and (m_salon == "-" or m_salon == salon_metni)
+                    (m_gun_saat == "-" or m_gun_saat in sess[0])
+                    and (m_salon == "-" or m_salon == sess[1])
                     and (m_oturum == "-" or m_oturum == oturum_id_metni)
                 ):
                     mod_atamalari[sess][role_key] = mod_metni
-                    hedef_musait_liste.remove(sess)
+                    hedef_musait.remove(sess)
                     atandi_mi = True
                     break
-        if not atandi_mi:
-            hedef_serbest_liste.append(mod_metni)
+        if not atandi_mi and mod_metni:
+            hedef_serbest.append(mod_metni)
 
     for mod_metni in serbest_mods:
         if musait_oturumlar_mod:
@@ -764,12 +868,10 @@ def ozel_etkinlikleri_hazirla(df_ozel):
         return gosterilecek
     if not {"oturum_sirasi", "salon"}.issubset(set(df_ozel.columns)):
         return gosterilecek
-    color_index = 0
-    for (sira, sal), grup in df_ozel.groupby(["oturum_sirasi", "salon"], sort=False):
+    for color_index, ((sira, sal), grup) in enumerate(df_ozel.groupby(["oturum_sirasi", "salon"], sort=False)):
         ks = clean_salon(sal)
         renk_temasi = soft_palette[color_index % len(soft_palette)]
-        color_index += 1
-        ts = str(grup.iloc[0].get("tarih_saat", "-")).strip().replace("Persembe", "Perşembe")
+        ts = safe_str(grup.iloc[0].get("tarih_saat")).replace("Persembe", "Perşembe")
         gosterilecek.append((sira, ks, grup, renk_temasi, ts))
     return gosterilecek
 
@@ -778,8 +880,7 @@ def gun_istatistikleri_olustur(prog):
     gun_istatistikleri = {}
     for (oturum_zaman, _sal), bilds in prog.items():
         t = oturum_zaman.split(" | ")[0] if " | " in oturum_zaman else oturum_zaman
-        if t not in gun_istatistikleri:
-            gun_istatistikleri[t] = {"oturum_sayisi": 0, "bildiri_sayisi": 0}
+        gun_istatistikleri.setdefault(t, {"oturum_sayisi": 0, "bildiri_sayisi": 0})
         gun_istatistikleri[t]["oturum_sayisi"] += 1
         gun_istatistikleri[t]["bildiri_sayisi"] += len(bilds)
     return gun_istatistikleri
@@ -801,12 +902,11 @@ def word_bas(df_bildiriler, df_ozel, df_mod, tip):
     h.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph()
 
-    if len(gosterilecek_ozel_etkinlikler) > 0:
+    if gosterilecek_ozel_etkinlikler:
         t_ozel_baslik = doc.add_table(rows=0, cols=2)
         t_ozel_baslik.style = "Table Grid"
         add_merged_row(t_ozel_baslik, "ÖZEL ETKİNLİKLER", "000000", text_color=(255, 255, 255), bold=True, align="center")
         doc.add_paragraph()
-
         for _sira, ks, grup, renk_temasi, ts in gosterilecek_ozel_etkinlikler:
             t_etk = doc.add_table(rows=0, cols=2)
             t_etk.style = "Table Grid"
@@ -814,9 +914,9 @@ def word_bas(df_bildiriler, df_ozel, df_mod, tip):
             for _, r in grup.iterrows():
                 m = "\n".join(
                     [
-                        str(r.get(c, "-")).strip()
+                        safe_str(r.get(c))
                         for c in ["ana_baslik", "alt_baslik", "sol_metin", "sag_metin"]
-                        if str(r.get(c, "-")).strip() not in ["-", "nan", ""]
+                        if safe_str(r.get(c)) not in ["-", "nan", ""]
                     ]
                 )
                 add_merged_row(t_etk, m, renk_temasi, align="center")
@@ -824,20 +924,11 @@ def word_bas(df_bildiriler, df_ozel, df_mod, tip):
 
     t_bilimsel_baslik = doc.add_table(rows=0, cols=2)
     t_bilimsel_baslik.style = "Table Grid"
-    add_merged_row(
-        t_bilimsel_baslik,
-        "--- BİLİMSEL BİLDİRİ PROGRAMI ---",
-        "000000",
-        text_color=(255, 255, 255),
-        bold=True,
-        align="center",
-    )
+    add_merged_row(t_bilimsel_baslik, "--- BİLİMSEL BİLDİRİ PROGRAMI ---", "000000", text_color=(255, 255, 255), bold=True, align="center")
     doc.add_paragraph()
 
     mevcut_islenen_gun = ""
-    sirali_oturumlar = sorted(prog.items(), key=lambda x: parse_zaman(x[0][0]))
-
-    for (oturum_zaman, sal), bilds in sirali_oturumlar:
+    for (oturum_zaman, sal), bilds in sorted(prog.items(), key=lambda x: parse_zaman(x[0][0])):
         parcalar = oturum_zaman.split(" | ")
         t = parcalar[0] if len(parcalar) > 0 else oturum_zaman
         sa = parcalar[1] if len(parcalar) > 1 else "-"
@@ -874,7 +965,6 @@ def word_bas(df_bildiriler, df_ozel, df_mod, tip):
         t_oturum.style = "Table Grid"
         add_merged_row(t_oturum, f"{t} | {sa}", "FFD966", bold=True)
         add_merged_row(t_oturum, oturum_metni, "FFE699", bold=True)
-
         for i, b in enumerate(bilds):
             bg_color = "F2F2F2" if i % 2 == 1 else "FFFFFF"
             row = t_oturum.add_row()
@@ -885,14 +975,14 @@ def word_bas(df_bildiriler, df_ozel, df_mod, tip):
             set_cell_bg(cell_yazar, bg_color)
             p = cell_yazar.paragraphs[0]
             if sunucu and sunucu not in ["-", "nan", ""] and sunucu in yazarlar_metni:
-                parcalar_yazar = yazarlar_metni.split(sunucu, 1)
-                if parcalar_yazar[0]:
-                    p.add_run(parcalar_yazar[0])
+                parts = yazarlar_metni.split(sunucu, 1)
+                if parts[0]:
+                    p.add_run(parts[0])
                 run_s = p.add_run(sunucu)
                 run_s.underline = True
                 run_s.bold = True
-                if len(parcalar_yazar) > 1 and parcalar_yazar[1]:
-                    p.add_run(parcalar_yazar[1])
+                if len(parts) > 1 and parts[1]:
+                    p.add_run(parts[1])
             else:
                 p.add_run(yazarlar_metni)
             row.cells[1].text = b["b"]
@@ -905,54 +995,18 @@ def word_bas(df_bildiriler, df_ozel, df_mod, tip):
     return output
 
 
-def oturum_ozeti_olustur(df_ayar):
-    df_ozet = df_ayar[["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"]].copy()
-    df_ozet = df_ozet[~df_ozet["Gun_ve_Saat"].isin(["-", "ATANMADI", "İPTAL EDİLDİ", "nan", "NaN", ""])]
-    df_ozet = df_ozet.dropna(subset=["Gun_ve_Saat"])
-    df_ozet["Salon"] = df_ozet["Salon"].apply(clean_salon)
-    df_grouped = (
-        df_ozet.groupby(["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"])
-        .size()
-        .reset_index(name="Atanan_Bildiri_Sayisi")
-    )
-    df_grouped["sort_time"] = df_grouped["Gun_ve_Saat"].apply(parse_zaman)
-    df_grouped = df_grouped.sort_values(by=["sort_time", "Salon"]).drop(columns=["sort_time"])
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_grouped.to_excel(writer, index=False, sheet_name="Oturum_Rontgeni")
-        workbook = writer.book
-        worksheet = writer.sheets["Oturum_Rontgeni"]
-        baslik_formati = workbook.add_format({"bold": True, "bg_color": "#4472C4", "font_color": "white", "border": 1})
-        for col_num, value in enumerate(df_grouped.columns.values):
-            worksheet.write(0, col_num, value, baslik_formati)
-        worksheet.set_column("A:A", 35)
-        worksheet.set_column("B:B", 25)
-        worksheet.set_column("C:C", 15)
-        worksheet.set_column("D:D", 15)
-        worksheet.set_column("E:E", 20)
-    output.seek(0)
-    return output
-
-
 def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
     prog = build_program_dict(df_bildiriler)
-    tum_zamanlar = set()
-    tum_salonlar = set()
-    for kz, ks in prog.keys():
-        tum_zamanlar.add(kz)
-        tum_salonlar.add(ks)
-
+    tum_zamanlar = {k[0] for k in prog.keys()}
+    tum_salonlar = {k[1] for k in prog.keys()}
     gosterilecek_ozel_etkinlikler = []
     soft_palette = ["#DDEBF7", "#FCE4D6", "#E2EFDA", "#FFF2CC", "#E6E6FA", "#F2F2F2"]
     if df_ozel is not None and not df_ozel.empty and {"oturum_sirasi", "salon"}.issubset(set(df_ozel.columns)):
-        color_index = 0
-        for (sira, sal), grup in df_ozel.groupby(["oturum_sirasi", "salon"], sort=False):
+        for color_index, ((sira, sal), grup) in enumerate(df_ozel.groupby(["oturum_sirasi", "salon"], sort=False)):
             ks = clean_salon(sal)
             tum_salonlar.add(ks)
             renk_temasi = soft_palette[color_index % len(soft_palette)]
-            color_index += 1
-            ts = str(grup.iloc[0].get("tarih_saat", "-")).strip().replace("Persembe", "Perşembe")
+            ts = safe_str(grup.iloc[0].get("tarih_saat")).replace("Persembe", "Perşembe")
             t_event = "07.05.2026 Perşembe" if "07" in ts else ("08.05.2026 Cuma" if "08" in ts else "Bilinmeyen Gun")
             m = re.search(r"(\d{2}[.:]\d{2})\s*-\s*(\d{2}[.:]\d{2})", ts)
             sa_event = f"{m.group(1).replace('.', ':')}-{m.group(2).replace('.', ':')}" if m else ts
@@ -968,14 +1022,11 @@ def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
 
     map_data = {}
     for (kz, ks), bilds in prog.items():
-        if (kz, ks) not in map_data:
-            map_data[(kz, ks)] = {"session_count": 0, "event_name": None, "event_color": None}
+        map_data.setdefault((kz, ks), {"session_count": 0, "event_name": None, "event_color": None})
         map_data[(kz, ks)]["session_count"] = len(bilds)
-
     for _sira, ks, grup, renk, zaman_key in gosterilecek_ozel_etkinlikler:
-        ana_baslik = str(grup.iloc[0].get("ana_baslik", "Etkinlik")).strip()
-        if (zaman_key, ks) not in map_data:
-            map_data[(zaman_key, ks)] = {"session_count": 0, "event_name": None, "event_color": None}
+        ana_baslik = safe_str(grup.iloc[0].get("ana_baslik")) or "Etkinlik"
+        map_data.setdefault((zaman_key, ks), {"session_count": 0, "event_name": None, "event_color": None})
         map_data[(zaman_key, ks)]["event_name"] = ana_baslik
         map_data[(zaman_key, ks)]["event_color"] = renk
 
@@ -995,7 +1046,6 @@ def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
     for col_idx, sal in enumerate(list_salonlar, 1):
         ws_harita.set_column(col_idx, col_idx, 25)
         ws_harita.write(0, col_idx, sal, f_map_baslik)
-
     for row_idx, z_key in enumerate(list_zamanlar, 1):
         ws_harita.write(row_idx, 0, z_key, f_map_saat)
         for col_idx, sal in enumerate(list_salonlar, 1):
@@ -1003,7 +1053,6 @@ def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
             s_count = hucre["session_count"]
             e_name = hucre["event_name"]
             e_color = hucre.get("event_color", "#FFD966")
-
             if s_count > 0 and e_name:
                 ws_harita.write(row_idx, col_idx, f"ÇAKIŞMA!\n[{s_count} Bildiri] VE [{e_name}]", f_map_cakisma)
                 ws_harita.set_row(row_idx, 45)
@@ -1020,7 +1069,6 @@ def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
     worksheet = workbook.add_worksheet("Kesin_Program")
     worksheet.set_column("A:A", 65)
     worksheet.set_column("B:B", 95)
-
     fmt = {
         "ayirici": workbook.add_format({"bg_color": "#000000", "font_color": "#FFFFFF", "bold": True, "align": "center", "valign": "vcenter"}),
         "baslik_dev": workbook.add_format({"bold": True, "font_size": 14, "align": "center", "valign": "vcenter", "border": 1}),
@@ -1043,24 +1091,18 @@ def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
     worksheet.set_row(satir_no, 40)
     satir_no += 2
 
-    if len(gosterilecek_ozel_etkinlikler) > 0:
+    if gosterilecek_ozel_etkinlikler:
         worksheet.merge_range(satir_no, 0, satir_no, 1, "ÖZEL ETKİNLİKLER", fmt["ayirici"])
         satir_no += 1
         for _sira, ks, grup, renk_temasi, _z_key in gosterilecek_ozel_etkinlikler:
-            ts = str(grup.iloc[0].get("tarih_saat", "-")).strip().replace("07.05.2026", "07.05.2026 Perşembe /").replace("08.05.2026", "08.05.2026 Cuma /")
+            ts = safe_str(grup.iloc[0].get("tarih_saat")).replace("07.05.2026", "07.05.2026 Perşembe /").replace("08.05.2026", "08.05.2026 Cuma /")
             if renk_temasi not in dinamik_renk_cache:
                 dinamik_renk_cache[renk_temasi] = workbook.add_format({"bold": True, "bg_color": renk_temasi, "align": "left", "valign": "vcenter", "border": 1, "text_wrap": True})
             dinamik_f = dinamik_renk_cache[renk_temasi]
             worksheet.merge_range(satir_no, 0, satir_no, 1, f"{ts} | HALL: {ks}", dinamik_f)
             satir_no += 1
             for _, r in grup.iterrows():
-                metin = "\n".join(
-                    [
-                        str(r.get(c, "-")).strip()
-                        for c in ["ana_baslik", "alt_baslik", "sol_metin", "sag_metin"]
-                        if str(r.get(c, "-")).strip() not in ["-", "nan", ""]
-                    ]
-                )
+                metin = "\n".join([safe_str(r.get(c)) for c in ["ana_baslik", "alt_baslik", "sol_metin", "sag_metin"] if safe_str(r.get(c)) not in ["-", "nan", ""]])
                 worksheet.merge_range(satir_no, 0, satir_no, 1, metin, dinamik_f)
                 worksheet.set_row(satir_no, 50)
                 satir_no += 1
@@ -1070,66 +1112,53 @@ def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
     satir_no += 2
 
     mevcut_islenen_gun = ""
-    sirali_oturumlar = sorted(prog.items(), key=lambda x: parse_zaman(x[0][0]))
-
-    for (oturum_zaman, sal), bilds in sirali_oturumlar:
+    for (oturum_zaman, sal), bilds in sorted(prog.items(), key=lambda x: parse_zaman(x[0][0])):
         parcalar = oturum_zaman.split(" | ")
         t = parcalar[0] if len(parcalar) > 0 else oturum_zaman
         sa = parcalar[1] if len(parcalar) > 1 else "-"
         sn = bilds[0]["sid"] if bilds else "-"
-
         if t != mevcut_islenen_gun:
             mevcut_islenen_gun = t
             worksheet.merge_range(satir_no, 0, satir_no, 1, f">>> {t.upper()} BİLİMSEL PROGRAMI <<<", fmt["mavi_gun"])
             worksheet.set_row(satir_no, 40)
             satir_no += 1
-
             odul_notu = "Her oturumdaki moderatör oturumu yönetecek ve Oturum Değerlendirici ile birbirinden bağımsız olarak EN İYİ BİLDİRİ (BEST PAPER) ÖDÜLLERi için bildiri sunumlarını değerlendireceklerdir."
             worksheet.merge_range(satir_no, 0, satir_no, 1, odul_notu, fmt["odul_sari"])
             worksheet.set_row(satir_no, 45)
             satir_no += 1
-
             o_sayi = gun_istatistikleri.get(t, {}).get("oturum_sayisi", 0)
             b_sayi = gun_istatistikleri.get(t, {}).get("bildiri_sayisi", 0)
-            istatistik_notu = f"Bugün toplam {o_sayi} adet bildiri sunum oturumu gerçekleşecek ve {b_sayi} adet bildiri sunulacaktır."
-            worksheet.merge_range(satir_no, 0, satir_no, 1, istatistik_notu, fmt["istatistik_yesil"])
+            worksheet.merge_range(satir_no, 0, satir_no, 1, f"Bugün toplam {o_sayi} adet bildiri sunum oturumu gerçekleşecek ve {b_sayi} adet bildiri sunulacaktır.", fmt["istatistik_yesil"])
             worksheet.set_row(satir_no, 25)
             satir_no += 2
 
         mod_isim = mod_atamalari[(oturum_zaman, sal)]["mod"]
         deg_isim = mod_atamalari[(oturum_zaman, sal)]["deg"]
         oturum_metni = f"HALL: {sal}\n{sn}\n\n{bilds[0]['k'].upper()}\nModerator: {mod_isim}\nOturum Değerlendirici: {deg_isim}"
-
         worksheet.merge_range(satir_no, 0, satir_no, 1, f"{t} | {sa}", fmt["saat_baslik"])
         satir_no += 1
         worksheet.merge_range(satir_no, 0, satir_no, 1, oturum_metni, fmt["salon_baslik"])
         worksheet.set_row(satir_no, 100)
         satir_no += 1
-
         for i, b in enumerate(bilds):
             yazarlar_metni, sunucu = b["y"], b["s"]
             is_cift = i % 2 == 1
             f_norm = fmt["bildiri_cift"] if is_cift else fmt["bildiri_tek"]
             f_ul_cell = fmt["bildiri_cift_u"] if is_cift else fmt["bildiri_tek_u"]
             f_ul_txt = fmt["bildiri_cift_u_only"] if is_cift else fmt["bildiri_tek_u_only"]
-
             if sunucu == yazarlar_metni and sunucu not in ["-", "nan", ""]:
                 worksheet.write(satir_no, 0, yazarlar_metni, f_ul_cell)
             elif sunucu in yazarlar_metni and sunucu not in ["-", "nan", ""]:
-                parcalar_yazar = yazarlar_metni.split(sunucu, 1)
+                parts = yazarlar_metni.split(sunucu, 1)
                 rich_text = []
-                if parcalar_yazar[0]:
-                    rich_text.extend([f_norm, parcalar_yazar[0]])
+                if parts[0]:
+                    rich_text.extend([f_norm, parts[0]])
                 rich_text.extend([f_ul_txt, sunucu])
-                if len(parcalar_yazar) > 1 and parcalar_yazar[1]:
-                    rich_text.extend([f_norm, parcalar_yazar[1]])
-                if len(rich_text) >= 2:
-                    worksheet.write_rich_string(satir_no, 0, *rich_text, f_norm)
-                else:
-                    worksheet.write(satir_no, 0, yazarlar_metni, f_norm)
+                if len(parts) > 1 and parts[1]:
+                    rich_text.extend([f_norm, parts[1]])
+                worksheet.write_rich_string(satir_no, 0, *rich_text, f_norm) if len(rich_text) >= 2 else worksheet.write(satir_no, 0, yazarlar_metni, f_norm)
             else:
                 worksheet.write(satir_no, 0, yazarlar_metni, f_norm)
-
             worksheet.write(satir_no, 1, b["b"], f_norm)
             satir_no += 1
         satir_no += 1
@@ -1139,122 +1168,128 @@ def excel_bas(df_bildiriler, df_ozel, df_mod, tip):
     return output
 
 
+def oturum_ozeti_olustur(df_master):
+    df_ozet = df_master[["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"]].copy()
+    df_ozet = df_ozet[~df_ozet["Gun_ve_Saat"].isin(["-", "ATANMADI", "İPTAL EDİLDİ", "nan", "NaN", ""])]
+    df_ozet["Salon"] = df_ozet["Salon"].apply(clean_salon)
+    df_grouped = df_ozet.groupby(["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"]).size().reset_index(name="Atanan_Bildiri_Sayisi")
+    df_grouped["sort_time"] = df_grouped["Gun_ve_Saat"].apply(parse_zaman)
+    df_grouped = df_grouped.sort_values(by=["sort_time", "Salon"]).drop(columns=["sort_time"])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_grouped.to_excel(writer, index=False, sheet_name="Oturum_Rontgeni")
+        workbook = writer.book
+        worksheet = writer.sheets["Oturum_Rontgeni"]
+        fmt = workbook.add_format({"bold": True, "bg_color": "#4472C4", "font_color": "white", "border": 1})
+        for col_num, value in enumerate(df_grouped.columns.values):
+            worksheet.write(0, col_num, value, fmt)
+        worksheet.set_column("A:A", 35)
+        worksheet.set_column("B:B", 25)
+        worksheet.set_column("C:E", 20)
+    output.seek(0)
+    return output
+
+
 # =========================
-# RAPOR MOTORLARI
+# RAPORLAR
 # =========================
 
-def make_genel_report(katilimcilar):
-    output = io.BytesIO()
-    writer = pd.ExcelWriter(output, engine="xlsxwriter")
-    rapor_list = []
-    for _, v in katilimcilar.items():
-        odeme = turkce_buyuk(v["Odeme"])
-        gorev = turkce_buyuk(v["Gorev"])
-        b_list = v["Bildiriler"]
-        renk = "WHITE"
-        if "MUAF" in odeme or "GÖREVLİ" in odeme or "DAVETLİ" in gorev:
-            renk = "PURPLE"
-        elif "İNDİRİM" in odeme or "ÖĞRENCİ" in odeme:
-            renk = "ORANGE"
-        elif "BEKLENİYOR" in odeme and len(b_list) > 0:
-            renk = "YELLOW"
-        elif "BEKLENİYOR" not in odeme and "YOK" not in odeme and len(b_list) > 0:
-            renk = "GREEN"
-        elif "BEKLENİYOR" not in odeme and "YOK" not in odeme and len(b_list) == 0:
-            renk = "BLUE"
-        rapor_list.append(
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name="Rapor"):
+    out = io.BytesIO()
+    df.to_excel(out, sheet_name=sheet_name, index=False)
+    return out.getvalue()
+
+
+def make_genel_report(participants_df, authors_df, submissions_df):
+    title_by_id = dict(zip(submissions_df["id"], submissions_df["title"])) if not submissions_df.empty else {}
+    sub_by_participant = {}
+    for _, a in authors_df.iterrows():
+        pid = a.get("participant_id")
+        if pid:
+            sub_by_participant.setdefault(pid, []).append(title_by_id.get(a["submission_id"], ""))
+    rows = []
+    for _, p in participants_df.iterrows():
+        b_list = sub_by_participant.get(p["id"], [])
+        rows.append(
             {
-                "Unvan": turkce_buyuk(v["Unvan"]),
-                "Adı Soyadı": v["Orijinal İsim"],
-                "Ödeme Durumu": odeme,
+                "Unvan": turkce_buyuk(safe_str(p.get("title"))),
+                "Adı Soyadı": safe_str(p.get("original_name")),
+                "Ödeme Durumu": turkce_buyuk(safe_str(p.get("payment"))),
                 "Bildiri 1": turkce_buyuk(b_list[0]) if len(b_list) > 0 else "",
                 "Bildiri 2": turkce_buyuk(b_list[1]) if len(b_list) > 1 else "",
-                "Katılım Türü": turkce_buyuk(v["Tur"]),
-                "_Color": renk,
+                "Katılım Türü": turkce_buyuk(safe_str(p.get("attendance_type"))),
+                "Telefon": safe_str(p.get("phone")),
+                "E-Posta": safe_str(p.get("email")),
             }
         )
-    df_r = pd.DataFrame(rapor_list).sort_values(by="Adı Soyadı") if rapor_list else pd.DataFrame()
-    if df_r.empty:
-        pd.DataFrame(columns=["Unvan", "Adı Soyadı", "Ödeme Durumu", "Bildiri 1", "Bildiri 2", "Katılım Türü"]).to_excel(writer, sheet_name="Genel Katılımcı Listesi", index=False)
-    else:
-        df_r.drop(columns=["_Color"]).to_excel(writer, sheet_name="Genel Katılımcı Listesi", index=False)
-        workbook = writer.book
-        ws = writer.sheets["Genel Katılımcı Listesi"]
-        fmts = {
-            "GREEN": workbook.add_format({"bg_color": "#C6EFCE"}),
-            "BLUE": workbook.add_format({"bg_color": "#BDD7EE"}),
-            "YELLOW": workbook.add_format({"bg_color": "#FFEB9C"}),
-            "PURPLE": workbook.add_format({"bg_color": "#E4DFEC"}),
-            "ORANGE": workbook.add_format({"bg_color": "#FCE4D6"}),
-        }
-        ws.set_column("B:B", 30)
-        ws.set_column("C:E", 40)
-        for i, r_code in enumerate(df_r["_Color"]):
-            if r_code in fmts:
-                ws.set_row(i + 1, cell_format=fmts[r_code])
-    writer.close()
-    return output.getvalue()
+    return dataframe_to_excel_bytes(pd.DataFrame(rows).sort_values("Adı Soyadı") if rows else pd.DataFrame())
 
 
-def make_unpaid_report(bildiriler, katilimcilar):
-    bekleyen = []
-    for _, bv in bildiriler.items():
-        if bv["Odeme"] == "Hayır":
-            yazarlar_str = ", ".join([turkce_buyuk(katilimcilar.get(y, {}).get("Orijinal İsim", y)) for y in bv["Yazarlar"]])
-            bekleyen.append({"KABUL EDİLMİŞ AMA ÖDENMEMİŞ BİLDİRİ": turkce_buyuk(bv["Orijinal İsim"]), "YAZARLARI": yazarlar_str})
-    out = io.BytesIO()
-    pd.DataFrame(bekleyen).to_excel(out, index=False)
-    return out.getvalue()
-
-
-def make_katilim_turu_report(katilimcilar, tur_tipi):
-    liste = []
-    for _, v in katilimcilar.items():
-        if super_temiz(tur_tipi) in super_temiz(v["Tur"]):
-            liste.append(
+def make_unpaid_report(submissions_df, authors_df):
+    rows = []
+    for _, s in submissions_df.iterrows():
+        if safe_str(s.get("payment")) == "Hayır":
+            sub_authors = authors_df[authors_df["submission_id"] == s["id"]].sort_values("author_order")
+            rows.append(
                 {
-                    "AD SOYAD": v["Orijinal İsim"],
-                    "UNVAN": turkce_buyuk(v["Unvan"]),
-                    "KATILIM TÜRÜ": turkce_buyuk(v["Tur"]),
-                    "ÖDEME DURUMU": v["Odeme"],
-                    "TELEFON": v["Telefon"],
-                    "E-POSTA": v["E-Posta"],
+                    "KABUL EDİLMİŞ AMA ÖDENMEMİŞ BİLDİRİ": turkce_buyuk(safe_str(s.get("title"))),
+                    "YAZARLARI": ", ".join([turkce_buyuk(x) for x in sub_authors["display_name"]]),
                 }
             )
-    out = io.BytesIO()
-    if liste:
-        pd.DataFrame(liste).sort_values(by="AD SOYAD").to_excel(out, index=False)
-    else:
-        pd.DataFrame(columns=["AD SOYAD", "UNVAN", "KATILIM TÜRÜ", "ÖDEME DURUMU", "TELEFON", "E-POSTA"]).to_excel(out, index=False)
-    return out.getvalue()
+    return dataframe_to_excel_bytes(pd.DataFrame(rows))
 
 
-def make_meal_report(katilimcilar, keys):
-    meals = []
-    for _, v in katilimcilar.items():
-        etk = super_temiz(v["Etkinlikler"])
+def make_participant_type_report(participants_df, text):
+    rows = []
+    for _, p in participants_df.iterrows():
+        if super_temiz(text) in super_temiz(safe_str(p.get("attendance_type"))):
+            rows.append(
+                {
+                    "AD SOYAD": safe_str(p.get("original_name")),
+                    "UNVAN": turkce_buyuk(safe_str(p.get("title"))),
+                    "KATILIM TÜRÜ": turkce_buyuk(safe_str(p.get("attendance_type"))),
+                    "ÖDEME DURUMU": safe_str(p.get("payment")),
+                    "TELEFON": safe_str(p.get("phone")),
+                    "E-POSTA": safe_str(p.get("email")),
+                }
+            )
+    return dataframe_to_excel_bytes(pd.DataFrame(rows).sort_values("AD SOYAD") if rows else pd.DataFrame(columns=["AD SOYAD", "UNVAN", "KATILIM TÜRÜ", "ÖDEME DURUMU", "TELEFON", "E-POSTA"]))
+
+
+def make_meal_report(participants_df, keys):
+    rows = []
+    for _, p in participants_df.iterrows():
+        etk = super_temiz(safe_str(p.get("events")))
         if all(super_temiz(x) in etk for x in keys):
-            meals.append({"AD SOYAD": v["Orijinal İsim"], "TUR": turkce_buyuk(v["Tur"]), "ODEME": turkce_buyuk(v["Odeme"])})
+            rows.append({"AD SOYAD": safe_str(p.get("original_name")), "TUR": turkce_buyuk(safe_str(p.get("attendance_type"))), "ODEME": turkce_buyuk(safe_str(p.get("payment")))})
+    return dataframe_to_excel_bytes(pd.DataFrame(rows) if rows else pd.DataFrame(columns=["AD SOYAD", "TUR", "ODEME"]))
+
+
+def export_master_excel(snapshot):
     out = io.BytesIO()
-    if meals:
-        pd.DataFrame(meals).to_excel(out, index=False)
-    else:
-        pd.DataFrame(columns=["AD SOYAD", "TUR", "ODEME"]).to_excel(out, index=False)
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        for key, sheet_name in [
+            ("participants", "participants"),
+            ("submissions", "submissions"),
+            ("authors", "submission_authors"),
+            ("moderators", "moderators"),
+            ("special_events", "special_events"),
+        ]:
+            snapshot[key].to_excel(writer, sheet_name=sheet_name, index=False)
     return out.getvalue()
 
 
 # =========================
-# STREAMLIT UI
+# STREAMLIT
 # =========================
 
-st.set_page_config(page_title="IHMC 2026 Süper Kongre Paneli", layout="wide", page_icon="📊")
+st.set_page_config(page_title="IHMC 2026 Supabase Paneli", layout="wide", page_icon="📊")
 
 st.markdown(
     """
     <style>
     .main { background-color: #f8fafc; }
     .stButton>button, .stDownloadButton>button { width: 100%; border-radius: 6px; font-weight: 700; }
-    .metric-card { padding: 1rem; border-radius: 8px; background: white; border: 1px solid #e2e8f0; }
     div[data-testid="stFormSubmitButton"] button {
         background-color: #2563eb !important;
         color: white !important;
@@ -1266,58 +1301,73 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.title("IHMC 2026 Kongre Yönetim Paneli")
+st.caption("Excel'den Supabase'e aktar, programı düzenle, salonları kontrol et, matbaa çıktılarını üret.")
 
-def sidebar_settings():
-    st.sidebar.title("Ayarlar")
-    kat_id = st.sidebar.text_input("Katılımcı veri Sheet ID", value=DEFAULT_KATILIMCI_SHEET_ID, key="sidebar_katilimci_sheet_id")
-    prog_id = st.sidebar.text_input("Program/Matbaa Sheet ID", value=DEFAULT_PROGRAM_SHEET_ID, key="sidebar_program_sheet_id")
-    writable = has_service_account() and get_gspread_client() is not None
-    if writable:
-        st.sidebar.success("Google Sheets yazma modu aktif")
-    else:
-        st.sidebar.warning("Sadece okuma modu. Yazmak için gcp_service_account secrets gerekli.")
-    if st.sidebar.button("Verileri Yenile", key="sidebar_refresh_data"):
-        st.cache_data.clear()
-        st.rerun()
-    st.sidebar.caption("Yazma için iki Google Sheet dosyasını servis hesabı e-postasıyla paylaşın.")
-    return kat_id, prog_id, writable
-
-
-def row_label(row, cols):
-    parts = [f"Satır {row.get('_row', '?')}"]
-    for col in cols:
-        if col in row and safe_str(row[col]):
-            parts.append(safe_str(row[col])[:90])
-    return " | ".join(parts)
-
-
-katilimci_sheet_id, program_sheet_id, writable = sidebar_settings()
-
-st.title("IHMC 2026 Süper Kongre Paneli")
-st.caption("Program yönetimi, matbaa çıktıları, katılımcı sorgulama, moderatör yönetimi ve raporlar tek ekranda.")
-
-try:
-    with st.spinner("Google Sheets verileri yükleniyor..."):
-        raw_data = load_all_data(katilimci_sheet_id, program_sheet_id, writable)
-    bildiriler, katilimcilar = build_database(raw_data)
-    df_master = build_matbaa_master(raw_data)
-except Exception as e:
-    st.error(f"Veri bağlantı hatası: {e}")
+if get_supabase() is None:
+    st.error("Supabase bağlantısı bulunamadı.")
+    st.write("Streamlit Cloud > App > Settings > Secrets bölümüne şunu ekle:")
+    st.code(
+        'SUPABASE_URL = "https://xxxxx.supabase.co"\nSUPABASE_SERVICE_ROLE_KEY = "supabase-service-role-key"',
+        language="toml",
+    )
     st.stop()
 
+with st.sidebar:
+    st.header("Veri")
+    if st.button("Verileri Yenile", key="refresh_data"):
+        st.cache_data.clear()
+        st.rerun()
 
-tab_search, tab_program, tab_salon, tab_mod, tab_matbaa, tab_reports, tab_telegram = st.tabs(
-    [
-        "Hızlı Sorgu",
-        "Bildiri Programı",
-        "Salon Kontrolü",
-        "Moderatörler",
-        "Matbaa",
-        "Raporlar",
-        "Telegram",
-    ]
+try:
+    snapshot = load_snapshot()
+except Exception as e:
+    st.error(f"Supabase okuma hatası: {e}")
+    st.info("Önce Supabase SQL Editor'de `supabase_schema.sql` dosyasındaki SQL'i çalıştırman gerekiyor.")
+    st.stop()
+
+bildiriler, katilimcilar = build_lookup(snapshot)
+df_master = df_master_from_snapshot(snapshot)
+df_mod_matbaa = moderators_df_for_matbaa(snapshot)
+df_ozel_matbaa = special_events_df_for_matbaa(snapshot)
+
+tab_import, tab_search, tab_program, tab_salon, tab_mod, tab_matbaa, tab_reports = st.tabs(
+    ["İçe Aktar", "Hızlı Sorgu", "Bildiri Programı", "Salon Kontrolü", "Moderatörler", "Matbaa", "Raporlar"]
 )
 
+with tab_import:
+    st.subheader("Excel'den Supabase'e İlk Aktarım")
+    st.warning("Bu aktarım mevcut Supabase verisini silip Excel'den yeniden kurar. Normal kullanımda sadece ilk kurulumda veya büyük veri yenilemede kullan.")
+    c1, c2 = st.columns(2)
+    katilimci_file = c1.file_uploader("Katılımcı Excel'i", type=["xlsx", "xls"], key="import_katilimci_file")
+    program_file = c2.file_uploader("Program/Matbaa Excel'i", type=["xlsx", "xls"], key="import_program_file")
+    st.caption("Tek ana Excel kullanıyorsan aynı dosyayı sadece ilk alana yükle; ikinci alan boş kalabilir.")
+    confirm = st.checkbox("Mevcut Supabase verisini silip bu Excel'den yeniden yükleyeceğimi onaylıyorum.", key="import_confirm")
+    if st.button("Supabase'e Aktar", key="import_button"):
+        if not katilimci_file:
+            st.error("En az bir Excel dosyası yüklemelisin.")
+        elif not confirm:
+            st.error("Silme/yükleme onayını işaretlemen gerekiyor.")
+        else:
+            try:
+                with st.spinner("Excel okunuyor ve Supabase'e aktarılıyor..."):
+                    summary = import_excel_to_supabase(katilimci_file, program_file)
+                st.cache_data.clear()
+                st.success(
+                    f"Aktarım tamamlandı: {summary['participants']} kişi, {summary['submissions']} bildiri, "
+                    f"{summary['authors']} yazar bağlantısı, {summary['moderators']} moderatör, "
+                    f"{summary['special_events']} özel etkinlik."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Aktarım hatası: {e}")
+
+    st.write("#### Mevcut Supabase Durumu")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Katılımcı", len(snapshot["participants"]))
+    c2.metric("Bildiri", len(snapshot["submissions"]))
+    c3.metric("Moderatör", len(snapshot["moderators"]))
+    c4.metric("Özel Etkinlik", len(snapshot["special_events"]))
 
 with tab_search:
     st.subheader("Katılımcı veya Bildiri Ara")
@@ -1325,416 +1375,288 @@ with tab_search:
         st.session_state.arama_metni = ""
     with st.form("search_form"):
         c1, c2 = st.columns([4, 1])
-        sorgu_input = c1.text_input("Arama", value=st.session_state.arama_metni, placeholder="Örn: Cihan veya Yapay Zeka", label_visibility="collapsed", key="search_query_input")
+        sorgu_input = c1.text_input("Arama", value=st.session_state.arama_metni, placeholder="Örn: Cihan veya Yapay Zeka", label_visibility="collapsed", key="search_query")
         arama = c2.form_submit_button("Ara")
     if arama:
         st.session_state.arama_metni = sorgu_input
-
-    sorgu_aktif = st.session_state.arama_metni
-    if sorgu_aktif:
-        t_sorgu = temiz_metin(sorgu_aktif)
-        found_kisiler = [k for k in katilimcilar.keys() if t_sorgu in k]
-        found_bildiriler = [b for b in bildiriler.keys() if t_sorgu in b]
-
-        if found_kisiler:
-            st.write(f"### Kişi Sonuçları ({len(found_kisiler)})")
-            for k_key in found_kisiler:
-                kv = katilimcilar[k_key]
-                with st.expander(f"{get_kisi_renk_emoji(kv)} {turkce_buyuk(kv['Unvan'])} {kv['Orijinal İsim']}", expanded=True):
+    sorgu = temiz_metin(st.session_state.arama_metni)
+    if sorgu:
+        found_people = [k for k in katilimcilar if sorgu in k]
+        found_subs = [k for k in bildiriler if sorgu in k]
+        if found_people:
+            st.write(f"### Kişi Sonuçları ({len(found_people)})")
+            for key in found_people:
+                p = katilimcilar[key]
+                with st.expander(f"{get_kisi_renk_emoji(p)} {safe_str(p.get('title'))} {safe_str(p.get('original_name'))}", expanded=True):
                     c1, c2 = st.columns(2)
-                    c1.write(f"**Ödeme:** {kv['Odeme']}")
-                    c1.write(f"**Görev:** {kv['Gorev']}")
-                    c1.write(f"**Katılım Türü:** {kv['Tur']}")
-                    c1.write(f"**Telefon:** {kv['Telefon'] or 'Kayıtlı değil'}")
-                    c1.write(f"**E-posta:** {kv['E-Posta'] or 'Kayıtlı değil'}")
-                    yemekler = ", ".join([y.strip() for y in super_temiz(kv["Etkinlikler"]).split(",") if y.strip()])
-                    c2.write(f"**Etkinlikler:** {yemekler if yemekler else 'Yok'}")
-                    c2.write(f"**Günler:** 6 Mayıs: {kv['Gunler']['6']} | 7 Mayıs: {kv['Gunler']['7']} | 8 Mayıs: {kv['Gunler']['8']}")
-                    st.write("**Bildirileri ve Programı:**")
-                    if kv["Bildiriler"]:
-                        for b in kv["Bildiriler"]:
-                            b_veri = bildiriler.get(temiz_metin(b), {})
-                            st.markdown(f"- {get_bildiri_renk_emoji(b_veri)} **{b}**")
-                            st.caption(get_program_info(b, raw_data.get("program_plan", pd.DataFrame())))
+                    c1.write(f"**Ödeme:** {safe_str(p.get('payment'))}")
+                    c1.write(f"**Görev:** {safe_str(p.get('role'))}")
+                    c1.write(f"**Katılım Türü:** {safe_str(p.get('attendance_type'))}")
+                    c1.write(f"**Telefon:** {safe_str(p.get('phone')) or 'Kayıtlı değil'}")
+                    c1.write(f"**E-posta:** {safe_str(p.get('email')) or 'Kayıtlı değil'}")
+                    c2.write(f"**Kurum:** {safe_str(p.get('institution')) or '-'}")
+                    c2.write(f"**Etkinlikler:** {safe_str(p.get('events')) or 'Yok'}")
+                    days = p.get("days") if isinstance(p.get("days"), dict) else {}
+                    c2.write(f"**Günler:** 6: {days.get('6', '')} | 7: {days.get('7', '')} | 8: {days.get('8', '')}")
+                    st.write("**Bildirileri:**")
+                    if p["submissions"]:
+                        for title in p["submissions"]:
+                            sub = next((b for b in bildiriler.values() if b["title"] == title), None)
+                            st.write(f"- {title}")
+                            if sub:
+                                st.caption(program_info(sub))
                     else:
                         st.write("Bildirisi yok.")
-
-        if found_bildiriler:
-            st.write(f"### Bildiri Sonuçları ({len(found_bildiriler)})")
-            for b_key in found_bildiriler:
-                bv = bildiriler[b_key]
-                with st.expander(f"{get_bildiri_renk_emoji(bv)} {bv['Orijinal İsim']}", expanded=True):
-                    st.write(f"**Konu:** {bv['Konu']} | **Butik:** {bv['Butik']}")
-                    st.write(f"**Ödeme:** {'Evet, Yapıldı' if bv.get('Odeme') == 'Evet' else 'Hayır, Bekliyor'}")
-                    st.write(f"**Program:** {get_program_info(bv['Orijinal İsim'], raw_data.get('program_plan', pd.DataFrame()))}")
+        if found_subs:
+            st.write(f"### Bildiri Sonuçları ({len(found_subs)})")
+            for key in found_subs:
+                b = bildiriler[key]
+                with st.expander(f"{get_bildiri_renk_emoji(b)} {safe_str(b.get('title'))}", expanded=True):
+                    st.write(f"**Konu:** {safe_str(b.get('topic'))} | **Butik:** {safe_str(b.get('boutique'))}")
+                    st.write(f"**Ödeme:** {'Evet, Yapıldı' if b.get('payment') == 'Evet' else 'Hayır, Bekliyor'}")
+                    st.write(f"**Program:** {program_info(b)}")
                     st.write("**Yazarlar:**")
-                    for y in bv["Yazarlar"]:
-                        y_kisi = katilimcilar.get(y, {})
-                        st.write(f"{get_kisi_renk_emoji(y_kisi)} {turkce_buyuk(y_kisi.get('Unvan', ''))} {turkce_buyuk(y_kisi.get('Orijinal İsim', y))}")
-
-        if not found_kisiler and not found_bildiriler:
+                    for author_norm in b["authors"]:
+                        p = katilimcilar.get(author_norm, {})
+                        st.write(f"{get_kisi_renk_emoji(p)} {safe_str(p.get('title'))} {safe_str(p.get('original_name', author_norm))}")
+        if not found_people and not found_subs:
             st.warning("Sonuç bulunamadı.")
-
 
 with tab_program:
     st.subheader("Bildiri Gün/Saat/Salon/Oturum/Sunum Tipi Yönetimi")
-    df_plan = raw_data.get("program_plan", pd.DataFrame()).copy()
-    df_bild = raw_data.get("program_bildiriler", pd.DataFrame()).copy()
-
-    required_cols = ["Bildiri_Adi", "Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"]
-    missing_required = [c for c in required_cols if c not in df_plan.columns]
-    if missing_required:
-        st.error(f"Program planı sheet'inde eksik kolonlar var: {', '.join(missing_required)}")
+    submissions_df = snapshot["submissions"].copy()
+    authors_df = snapshot["authors"].copy()
+    if submissions_df.empty:
+        st.warning("Henüz bildiri yok. Önce Excel aktarımı yap.")
     else:
         f1, f2, f3 = st.columns(3)
-        q = f1.text_input("Bildiri adı filtrele", "", key="program_bildiri_filter")
-        tip_filter = f2.multiselect("Sunum tipi", sorted([x for x in df_plan["Sunum_Tipi"].dropna().unique() if safe_str(x)]), key="program_sunum_tipi_filter")
-        gunler = sorted({gun_key(x) for x in df_plan["Gun_ve_Saat"].dropna().astype(str) if safe_str(x)}, key=parse_zaman)
-        gun_filter = f3.multiselect("Gün", gunler, key="program_gun_filter")
+        q = f1.text_input("Bildiri adı filtrele", "", key="program_filter_title")
+        tip_filter = f2.multiselect("Sunum tipi", sorted([x for x in submissions_df["presentation_type"].dropna().unique() if safe_str(x)]), key="program_filter_type")
+        gunler = sorted({gun_key(x) for x in submissions_df["session_time"].dropna().astype(str) if safe_str(x)}, key=parse_zaman)
+        gun_filter = f3.multiselect("Gün", gunler, key="program_filter_day")
 
-        df_show = df_plan.copy()
+        df_show = submissions_df.copy()
         if q:
-            df_show = df_show[df_show["Bildiri_Adi"].astype(str).apply(lambda x: temiz_metin(q) in temiz_metin(x))]
+            df_show = df_show[df_show["title"].astype(str).apply(lambda x: temiz_metin(q) in temiz_metin(x))]
         if tip_filter:
-            df_show = df_show[df_show["Sunum_Tipi"].isin(tip_filter)]
+            df_show = df_show[df_show["presentation_type"].isin(tip_filter)]
         if gun_filter:
-            df_show = df_show[df_show["Gun_ve_Saat"].astype(str).apply(lambda x: gun_key(x) in gun_filter)]
+            df_show = df_show[df_show["session_time"].astype(str).apply(lambda x: gun_key(x) in gun_filter)]
 
-        st.dataframe(
-            df_show[[c for c in ["_row", "Bildiri_Adi", "Sunum_Tipi", "Gun_ve_Saat", "Salon", "Oturum_ID"] if c in df_show.columns]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
+        show_cols = ["id", "title", "presentation_type", "session_time", "hall", "session_id", "topic", "payment"]
+        st.dataframe(df_show[show_cols], use_container_width=True, hide_index=True)
         if not df_show.empty:
-            options = {row_label(r, ["Bildiri_Adi", "Sunum_Tipi", "Gun_ve_Saat", "Salon", "Oturum_ID"]): r for _, r in df_show.iterrows()}
-            selected_label = st.selectbox("Düzenlenecek bildiriyi seç", list(options.keys()), key="program_selected_bildiri")
-            selected = options[selected_label]
-            selected_bildiri = safe_str(selected["Bildiri_Adi"])
-
-            existing_sessions = (
-                df_plan[["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"]]
-                .drop_duplicates()
-                .sort_values(by=["Gun_ve_Saat", "Salon"], key=lambda s: s.astype(str))
-            )
+            labels = {
+                f"{r['id']} | {safe_str(r['title'])[:90]} | {safe_str(r['presentation_type'])} | {safe_str(r['session_time'])} | {safe_str(r['hall'])}": r
+                for _, r in df_show.iterrows()
+            }
+            selected_label = st.selectbox("Düzenlenecek bildiri", list(labels.keys()), key="program_selected_submission")
+            selected = labels[selected_label]
+            sessions = submissions_df[["presentation_type", "session_time", "hall", "session_id"]].drop_duplicates()
             session_labels = [
-                f"{r['Sunum_Tipi']} | {r['Gun_ve_Saat']} | {r['Salon']} | {r['Oturum_ID']}"
-                for _, r in existing_sessions.iterrows()
+                f"{safe_str(r['presentation_type'])} | {safe_str(r['session_time'])} | {safe_str(r['hall'])} | {safe_str(r['session_id'])}"
+                for _, r in sessions.iterrows()
             ]
-
-            st.write("#### Seçili Bildiriyi Taşı / Güncelle")
             with st.form("program_update_form"):
-                use_existing = st.checkbox("Mevcut bir oturuma taşı", value=True, key="program_use_existing_session")
+                use_existing = st.checkbox("Mevcut oturuma taşı", value=True, key="program_use_existing")
                 if use_existing and session_labels:
-                    current_label = f"{selected['Sunum_Tipi']} | {selected['Gun_ve_Saat']} | {selected['Salon']} | {selected['Oturum_ID']}"
-                    default_index = session_labels.index(current_label) if current_label in session_labels else 0
-                    chosen_session = st.selectbox("Hedef oturum", session_labels, index=default_index, key="program_target_session")
-                    chosen_parts = chosen_session.split(" | ", 3)
-                    new_tip, new_time, new_salon, new_oturum = chosen_parts[0], chosen_parts[1], chosen_parts[2], chosen_parts[3]
+                    current_label = f"{safe_str(selected['presentation_type'])} | {safe_str(selected['session_time'])} | {safe_str(selected['hall'])} | {safe_str(selected['session_id'])}"
+                    idx = session_labels.index(current_label) if current_label in session_labels else 0
+                    chosen = st.selectbox("Hedef oturum", session_labels, index=idx, key="program_target_session")
+                    p = chosen.split(" | ", 3)
+                    new_type, new_time, new_hall, new_session = p[0], p[1], p[2], p[3]
                 else:
                     c1, c2 = st.columns(2)
-                    new_tip = c1.selectbox("Sunum tipi", ["Yuzyuze", "Online"], index=0 if safe_str(selected["Sunum_Tipi"]) != "Online" else 1, key="program_manual_tip")
-                    new_time = c2.text_input("Gün ve saat", value=safe_str(selected["Gun_ve_Saat"]), key="program_manual_time")
+                    new_type = c1.selectbox("Sunum tipi", ["Yuzyuze", "Online"], index=1 if safe_str(selected["presentation_type"]) == "Online" else 0, key="program_manual_type")
+                    new_time = c2.text_input("Gün ve saat", value=safe_str(selected["session_time"]), key="program_manual_time")
                     c3, c4 = st.columns(2)
-                    salon_options = sorted({safe_str(x) for x in df_plan["Salon"].dropna().unique() if safe_str(x)})
-                    if safe_str(selected["Salon"]) not in salon_options:
-                        salon_options.insert(0, safe_str(selected["Salon"]))
-                    new_salon = c3.selectbox("Salon", salon_options, key="program_manual_salon_select") if salon_options else c3.text_input("Salon", value=safe_str(selected["Salon"]), key="program_manual_salon_text")
-                    new_oturum = c4.text_input("Oturum ID", value=safe_str(selected["Oturum_ID"]), key="program_manual_oturum")
+                    halls = sorted({safe_str(x) for x in submissions_df["hall"].dropna().unique() if safe_str(x)})
+                    new_hall = c3.selectbox("Salon", halls, index=halls.index(safe_str(selected["hall"])) if safe_str(selected["hall"]) in halls else 0, key="program_manual_hall") if halls else c3.text_input("Salon", value=safe_str(selected["hall"]), key="program_manual_hall_text")
+                    new_session = c4.text_input("Oturum ID", value=safe_str(selected["session_id"]), key="program_manual_session")
 
-                current_authors = bildiriler.get(temiz_metin(selected_bildiri), {}).get("Yazarlar", [])
-                current_presenter = bildiriler.get(temiz_metin(selected_bildiri), {}).get("Sunucu", "")
-                author_display = [turkce_buyuk(a) for a in current_authors]
-                author_map = {turkce_buyuk(a): a for a in current_authors}
-                presenter_choice = st.selectbox(
-                    "Sunacak yazar",
-                    ["Değiştirme"] + author_display + ["Elle yaz"],
-                    index=0,
-                    key="program_presenter_choice",
-                )
+                sub_authors = authors_df[authors_df["submission_id"] == selected["id"]].sort_values("author_order")
+                author_labels = [safe_str(x) for x in sub_authors["display_name"]]
+                author_norm_by_label = dict(zip(author_labels, sub_authors["norm_name"]))
+                presenter_choice = st.selectbox("Sunacak yazar", ["Değiştirme"] + author_labels + ["Elle yaz"], key="program_presenter")
                 presenter_free = ""
                 if presenter_choice == "Elle yaz":
-                    presenter_free = st.text_input("Yeni sunucu adı", value=current_presenter, key="program_presenter_free")
-
-                kaydet = st.form_submit_button("Bildiri Güncelle")
-
-            if kaydet:
-                if not writable:
-                    st.error("Yazma modu aktif değil. Önce Streamlit secrets içine servis hesabı ekleyin.")
-                else:
-                    try:
-                        update_sheet_row(
-                            program_sheet_id,
-                            PROGRAM_PLAN_INDEX,
-                            int(selected["_row"]),
-                            {
-                                "Gun_ve_Saat": new_time,
-                                "Salon": new_salon,
-                                "Oturum_ID": new_oturum,
-                                "Sunum_Tipi": new_tip,
-                            },
-                        )
-                        if presenter_choice != "Değiştirme":
-                            new_presenter = presenter_free if presenter_choice == "Elle yaz" else author_map[presenter_choice]
-                            b_name_col = find_col(df_bild, ["Bildiri Ismi", "Bildiri_Adi", "Bildiri Adı"], contains=["bildiri"])
-                            presenter_col = find_col(df_bild, ["Sunan Yazar", "sunucu", "Sunucu"], contains=["sunan"])
-                            if b_name_col and presenter_col:
-                                b_row = find_row_by_value(program_sheet_id, PROGRAM_BILDIRILER_SHEET, b_name_col, selected_bildiri)
-                                if b_row:
-                                    update_sheet_row(program_sheet_id, PROGRAM_BILDIRILER_SHEET, b_row, {presenter_col: new_presenter})
-                        st.cache_data.clear()
-                        st.success("Bildiri güncellendi.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Güncelleme hatası: {e}")
-
+                    presenter_free = st.text_input("Yeni sunucu adı", value=safe_str(selected["presenter_norm_name"]), key="program_presenter_free")
+                save = st.form_submit_button("Bildiri Güncelle")
+            if save:
+                presenter_norm = safe_str(selected["presenter_norm_name"])
+                if presenter_choice != "Değiştirme":
+                    presenter_norm = temiz_isim(presenter_free) if presenter_choice == "Elle yaz" else author_norm_by_label[presenter_choice]
+                try:
+                    update_by_id(
+                        "submissions",
+                        int(selected["id"]),
+                        {
+                            "presentation_type": new_type,
+                            "session_time": new_time,
+                            "hall": new_hall,
+                            "session_id": new_session,
+                            "presenter_norm_name": presenter_norm,
+                        },
+                    )
+                    st.cache_data.clear()
+                    st.success("Bildiri güncellendi.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Güncelleme hatası: {e}")
 
 with tab_salon:
-    st.subheader("Ekranda Salon ve Oturum Kapasite Kontrolü")
-    df_plan = raw_data.get("program_plan", pd.DataFrame()).copy()
-    if df_plan.empty or "Gun_ve_Saat" not in df_plan.columns or "Salon" not in df_plan.columns:
-        st.warning("Program planı bulunamadı.")
+    st.subheader("Salon ve Oturum Kapasite Kontrolü")
+    if df_master.empty:
+        st.warning("Program verisi yok.")
     else:
-        valid = df_plan[~df_plan["Gun_ve_Saat"].isin(["", "-", "nan", "NaN", "ATANMADI", "İPTAL EDİLDİ"])].copy()
+        valid = df_master[~df_master["Gun_ve_Saat"].isin(["", "-", "nan", "NaN", "ATANMADI", "İPTAL EDİLDİ"])].copy()
         valid["Gün"] = valid["Gun_ve_Saat"].apply(gun_key)
         gunler = sorted(valid["Gün"].dropna().unique(), key=parse_zaman)
-        secili_gun = st.selectbox("Kontrol edilecek gün", ["Tümü"] + list(gunler), key="salon_control_day")
+        secili_gun = st.selectbox("Kontrol edilecek gün", ["Tümü"] + list(gunler), key="salon_day")
         if secili_gun != "Tümü":
             valid = valid[valid["Gün"] == secili_gun]
-
         c1, c2, c3 = st.columns(3)
         c1.metric("Toplam Bildiri", len(valid))
         c2.metric("Aktif Salon", valid["Salon"].nunique())
-        c3.metric("Oturum", valid[["Gun_ve_Saat", "Salon", "Oturum_ID"]].drop_duplicates().shape[0] if "Oturum_ID" in valid.columns else valid[["Gun_ve_Saat", "Salon"]].drop_duplicates().shape[0])
-
+        c3.metric("Oturum", valid[["Gun_ve_Saat", "Salon", "Oturum_ID"]].drop_duplicates().shape[0])
         counts = valid.groupby("Salon").size().reset_index(name="Bildiri Sayısı").sort_values("Bildiri Sayısı", ascending=False)
-        st.write("#### Salonlara Göre Bildiri Sayısı")
         st.dataframe(counts, use_container_width=True, hide_index=True)
         st.bar_chart(counts.set_index("Salon"))
-
-        st.write("#### Saat x Salon Haritası")
         pivot = valid.pivot_table(index="Gun_ve_Saat", columns="Salon", values="Bildiri_Adi", aggfunc="count", fill_value=0)
         pivot = pivot.sort_index(key=lambda idx: idx.map(parse_zaman))
+        st.write("#### Saat x Salon Haritası")
         st.dataframe(pivot, use_container_width=True)
-
-        st.write("#### Oturum Detayı")
-        detail_cols = [c for c in ["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi", "Bildiri_Adi"] if c in valid.columns]
-        st.dataframe(valid[detail_cols].sort_values(by=["Gun_ve_Saat", "Salon"], key=lambda s: s.astype(str)), use_container_width=True, hide_index=True)
-
 
 with tab_mod:
     st.subheader("Moderatör ve Oturum Değerlendirici Yönetimi")
-    df_mod = raw_data.get("mod", pd.DataFrame()).copy()
-    df_plan = raw_data.get("program_plan", pd.DataFrame()).copy()
-    if df_mod.empty:
-        st.warning("Moderatorler sheet'i bulunamadı veya boş.")
+    moderators_df = snapshot["moderators"].copy()
+    if moderators_df.empty:
+        st.warning("Moderatör verisi yok.")
     else:
-        view_cols = [c for c in ["_row", "unvan_ad_soyad", "kurum", "Gorev", "Gun_ve_Saat", "Salon", "Oturum_ID", "Online"] if c in df_mod.columns]
-        st.dataframe(df_mod[view_cols], use_container_width=True, hide_index=True)
-
+        st.dataframe(moderators_df[["id", "name", "institution", "duty", "session_time", "hall", "session_id", "online"]], use_container_width=True, hide_index=True)
         mod_tab1, mod_tab2 = st.tabs(["Tek Kişi Değiştir", "İki Kişiyi Yer Değiştir"])
-
         with mod_tab1:
-            options = {row_label(r, ["unvan_ad_soyad", "Gorev", "Gun_ve_Saat", "Salon", "Oturum_ID"]): r for _, r in df_mod.iterrows()}
-            selected_label = st.selectbox("Düzenlenecek moderatör/değerlendirici", list(options.keys()), key="mod_selected_person")
-            selected = options[selected_label]
-
-            session_labels = []
-            if not df_plan.empty and {"Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"}.issubset(df_plan.columns):
-                sessions = df_plan[["Gun_ve_Saat", "Salon", "Oturum_ID", "Sunum_Tipi"]].drop_duplicates()
-                session_labels = [
-                    f"{r['Sunum_Tipi']} | {r['Gun_ve_Saat']} | {r['Salon']} | {r['Oturum_ID']}"
-                    for _, r in sessions.iterrows()
-                ]
-
+            labels = {
+                f"{r['id']} | {safe_str(r['name'])} | {safe_str(r['duty'])} | {safe_str(r['session_time'])} | {safe_str(r['hall'])}": r
+                for _, r in moderators_df.iterrows()
+            }
+            selected_label = st.selectbox("Düzenlenecek moderatör/değerlendirici", list(labels.keys()), key="mod_selected")
+            selected = labels[selected_label]
+            sessions = snapshot["submissions"][["presentation_type", "session_time", "hall", "session_id"]].drop_duplicates()
+            session_labels = [f"{safe_str(r['presentation_type'])} | {safe_str(r['session_time'])} | {safe_str(r['hall'])} | {safe_str(r['session_id'])}" for _, r in sessions.iterrows()]
             with st.form("mod_update_form"):
                 c1, c2 = st.columns(2)
-                new_name = c1.text_input("Ad Soyad / Ünvan", value=safe_str(selected.get("unvan_ad_soyad", "")), key="mod_name")
-                new_kurum = c2.text_input("Kurum", value=safe_str(selected.get("kurum", "")), key="mod_kurum")
+                new_name = c1.text_input("Ad Soyad / Ünvan", value=safe_str(selected["name"]), key="mod_name")
+                new_inst = c2.text_input("Kurum", value=safe_str(selected["institution"]), key="mod_institution")
                 c3, c4 = st.columns(2)
-                new_gorev = c3.text_input("Görev", value=safe_str(selected.get("Gorev", "")), key="mod_gorev")
-                new_online = c4.selectbox("Online", ["Hayır", "Evet"], index=1 if safe_str(selected.get("Online", "")).lower() in ["evet", "online", "true", "1"] else 0, key="mod_online")
-
-                use_existing_session = st.checkbox("Mevcut oturuma ata", value=True, key="mod_use_existing_session")
-                if use_existing_session and session_labels:
-                    current_session = f"{'Online' if new_online == 'Evet' else 'Yuzyuze'} | {safe_str(selected.get('Gun_ve_Saat', ''))} | {safe_str(selected.get('Salon', ''))} | {safe_str(selected.get('Oturum_ID', ''))}"
-                    idx = session_labels.index(current_session) if current_session in session_labels else 0
-                    chosen_session = st.selectbox("Hedef oturum", session_labels, index=idx, key="mod_target_session")
-                    p = chosen_session.split(" | ", 3)
-                    _tip, new_time, new_salon, new_oturum = p[0], p[1], p[2], p[3]
-                    new_online = "Evet" if _tip == "Online" else "Hayır"
+                new_duty = c3.text_input("Görev", value=safe_str(selected["duty"]), key="mod_duty")
+                new_online_text = c4.selectbox("Online", ["Hayır", "Evet"], index=1 if bool(selected["online"]) else 0, key="mod_online")
+                use_session = st.checkbox("Mevcut oturuma ata", value=True, key="mod_use_session")
+                if use_session and session_labels:
+                    chosen = st.selectbox("Hedef oturum", session_labels, key="mod_target_session")
+                    p = chosen.split(" | ", 3)
+                    new_online_text = "Evet" if p[0] == "Online" else "Hayır"
+                    new_time, new_hall, new_session = p[1], p[2], p[3]
                 else:
                     c5, c6 = st.columns(2)
-                    new_time = c5.text_input("Gün ve saat", value=safe_str(selected.get("Gun_ve_Saat", "")), key="mod_manual_time")
-                    new_salon = c6.text_input("Salon", value=safe_str(selected.get("Salon", "")), key="mod_manual_salon")
-                    new_oturum = st.text_input("Oturum ID", value=safe_str(selected.get("Oturum_ID", "")), key="mod_manual_oturum")
-
-                mod_kaydet = st.form_submit_button("Moderatör Kaydet")
-
-            if mod_kaydet:
-                if not writable:
-                    st.error("Yazma modu aktif değil.")
-                else:
-                    try:
-                        update_sheet_row(
-                            program_sheet_id,
-                            PROGRAM_MOD_SHEET,
-                            int(selected["_row"]),
-                            {
-                                "unvan_ad_soyad": new_name,
-                                "kurum": new_kurum,
-                                "Gorev": new_gorev,
-                                "Gun_ve_Saat": new_time,
-                                "Salon": new_salon,
-                                "Oturum_ID": new_oturum,
-                                "Online": new_online,
-                            },
-                        )
-                        st.cache_data.clear()
-                        st.success("Moderatör kaydı güncellendi.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Güncelleme hatası: {e}")
+                    new_time = c5.text_input("Gün ve saat", value=safe_str(selected["session_time"]), key="mod_time")
+                    new_hall = c6.text_input("Salon", value=safe_str(selected["hall"]), key="mod_hall")
+                    new_session = st.text_input("Oturum ID", value=safe_str(selected["session_id"]), key="mod_session")
+                save_mod = st.form_submit_button("Moderatör Kaydet")
+            if save_mod:
+                try:
+                    update_by_id(
+                        "moderators",
+                        int(selected["id"]),
+                        {
+                            "name": new_name,
+                            "institution": new_inst,
+                            "duty": new_duty,
+                            "session_time": new_time,
+                            "hall": new_hall,
+                            "session_id": new_session,
+                            "online": new_online_text == "Evet",
+                        },
+                    )
+                    st.cache_data.clear()
+                    st.success("Moderatör güncellendi.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Güncelleme hatası: {e}")
 
         with mod_tab2:
-            st.caption("İki satır arasında ya kişileri ya da oturum atamalarını değiştirebilirsin.")
-            options = {row_label(r, ["unvan_ad_soyad", "Gorev", "Gun_ve_Saat", "Salon", "Oturum_ID"]): r for _, r in df_mod.iterrows()}
+            labels = {
+                f"{r['id']} | {safe_str(r['name'])} | {safe_str(r['duty'])} | {safe_str(r['session_time'])} | {safe_str(r['hall'])}": r
+                for _, r in moderators_df.iterrows()
+            }
             c1, c2 = st.columns(2)
-            left_label = c1.selectbox("1. kişi", list(options.keys()), key="swap_left")
-            right_label = c2.selectbox("2. kişi", list(options.keys()), key="swap_right")
-            swap_mode = st.radio("Değişim tipi", ["Oturumlarını değiştir", "Kişi isimlerini değiştir"], horizontal=True, key="mod_swap_mode")
-            if st.button("Yer Değiştir", key="mod_swap_button"):
-                if not writable:
-                    st.error("Yazma modu aktif değil.")
-                elif left_label == right_label:
+            left_label = c1.selectbox("1. kişi", list(labels.keys()), key="swap_left")
+            right_label = c2.selectbox("2. kişi", list(labels.keys()), key="swap_right")
+            swap_mode = st.radio("Değişim tipi", ["Oturumlarını değiştir", "Kişi isimlerini değiştir"], horizontal=True, key="swap_mode")
+            if st.button("Yer Değiştir", key="swap_button"):
+                if left_label == right_label:
                     st.warning("İki farklı kişi seçmelisin.")
                 else:
-                    left = options[left_label]
-                    right = options[right_label]
+                    left = labels[left_label]
+                    right = labels[right_label]
+                    fields = ["session_time", "hall", "session_id", "online"] if swap_mode == "Oturumlarını değiştir" else ["name", "institution"]
                     try:
-                        if swap_mode == "Oturumlarını değiştir":
-                            fields = ["Gun_ve_Saat", "Salon", "Oturum_ID", "Online"]
-                        else:
-                            fields = ["unvan_ad_soyad", "kurum"]
-                        left_updates = {f: safe_str(right.get(f, "")) for f in fields if f in df_mod.columns}
-                        right_updates = {f: safe_str(left.get(f, "")) for f in fields if f in df_mod.columns}
-                        update_sheet_row(program_sheet_id, PROGRAM_MOD_SHEET, int(left["_row"]), left_updates)
-                        update_sheet_row(program_sheet_id, PROGRAM_MOD_SHEET, int(right["_row"]), right_updates)
+                        update_by_id("moderators", int(left["id"]), {f: right[f] for f in fields})
+                        update_by_id("moderators", int(right["id"]), {f: left[f] for f in fields})
                         st.cache_data.clear()
                         st.success("Değişim yapıldı.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Değişim hatası: {e}")
 
-
 with tab_matbaa:
     st.subheader("Matbaa Çıktıları")
     if df_master.empty:
-        st.error("Matbaa için program ana verisi hazırlanamadı.")
+        st.warning("Henüz program verisi yok.")
     else:
-        st.info("Bu bölüm önceki matbaa mantığını korur; güncel Sheet verisinden Excel ve Word dosyaları üretir.")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Toplam Program Kaydı", len(df_master))
+        c1.metric("Toplam Bildiri", len(df_master))
         c2.metric("Yüz yüze", (df_master["Sunum_Tipi"] == "Yuzyuze").sum())
         c3.metric("Online", (df_master["Sunum_Tipi"] == "Online").sum())
-
-        if st.button("Matbaayı Çalıştır ve Dosyaları Hazırla", key="matbaa_build_outputs"):
+        if st.button("Matbaayı Çalıştır ve Dosyaları Hazırla", key="matbaa_build"):
             with st.spinner("Excel ve Word çıktıları hazırlanıyor..."):
                 df_yz = df_master[df_master["Sunum_Tipi"] == "Yuzyuze"]
                 df_on = df_master[df_master["Sunum_Tipi"] == "Online"]
                 st.session_state["matbaa_outputs"] = {
-                    "excel_yz": excel_bas(df_yz, raw_data.get("ozel", pd.DataFrame()), raw_data.get("mod", pd.DataFrame()), "YUZYUZE").getvalue(),
-                    "word_yz": word_bas(df_yz, raw_data.get("ozel", pd.DataFrame()), raw_data.get("mod", pd.DataFrame()), "YUZYUZE").getvalue(),
-                    "excel_on": excel_bas(df_on, raw_data.get("ozel", pd.DataFrame()), raw_data.get("mod", pd.DataFrame()), "ONLINE").getvalue(),
-                    "word_on": word_bas(df_on, raw_data.get("ozel", pd.DataFrame()), raw_data.get("mod", pd.DataFrame()), "ONLINE").getvalue(),
+                    "excel_yz": excel_bas(df_yz, df_ozel_matbaa, df_mod_matbaa, "YUZYUZE").getvalue(),
+                    "word_yz": word_bas(df_yz, df_ozel_matbaa, df_mod_matbaa, "YUZYUZE").getvalue(),
+                    "excel_on": excel_bas(df_on, df_ozel_matbaa, df_mod_matbaa, "ONLINE").getvalue(),
+                    "word_on": word_bas(df_on, df_ozel_matbaa, df_mod_matbaa, "ONLINE").getvalue(),
                     "ozet": oturum_ozeti_olustur(df_master).getvalue(),
                 }
                 st.success("Matbaa çıktıları hazır.")
-
         outputs = st.session_state.get("matbaa_outputs")
         if outputs:
             c1, c2 = st.columns(2)
             with c1:
                 st.write("#### Yüz Yüze Program")
-                st.download_button("Excel İndir", outputs["excel_yz"], file_name="Nihai_Program_Yuzyuze.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_excel_yuzyuze")
-                st.download_button("Word İndir", outputs["word_yz"], file_name="Nihai_Program_Yuzyuze.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="download_word_yuzyuze")
+                st.download_button("Excel İndir", outputs["excel_yz"], file_name="Nihai_Program_Yuzyuze.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_yz_xlsx")
+                st.download_button("Word İndir", outputs["word_yz"], file_name="Nihai_Program_Yuzyuze.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_yz_docx")
             with c2:
                 st.write("#### Online Program")
-                st.download_button("Excel İndir", outputs["excel_on"], file_name="Nihai_Program_Online.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_excel_online")
-                st.download_button("Word İndir", outputs["word_on"], file_name="Nihai_Program_Online.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="download_word_online")
-            st.download_button("Oturum Röntgen Özeti İndir", outputs["ozet"], file_name="Oturum_Rontgen_Ozeti.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_oturum_ozeti")
-
+                st.download_button("Excel İndir", outputs["excel_on"], file_name="Nihai_Program_Online.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_on_xlsx")
+                st.download_button("Word İndir", outputs["word_on"], file_name="Nihai_Program_Online.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_on_docx")
+            st.download_button("Oturum Röntgen Özeti İndir", outputs["ozet"], file_name="Oturum_Rontgen_Ozeti.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_ozet")
 
 with tab_reports:
-    st.subheader("Raporlar ve Excel İndirme Merkezi")
+    st.subheader("Raporlar ve Yedek")
+    participants_df = snapshot["participants"]
+    submissions_df = snapshot["submissions"]
+    authors_df = snapshot["authors"]
     c1, c2 = st.columns(2)
-    c1.download_button("Genel Katılımcı Analizi", data=make_genel_report(katilimcilar), file_name="IHMC_Genel_Rapor.xlsx", use_container_width=True, key="download_genel_rapor")
-    c1.download_button("Sadece Online Katılımcılar", data=make_katilim_turu_report(katilimcilar, "ONLINE"), file_name="Online_Katilimcilar.xlsx", use_container_width=True, key="download_online_katilimcilar")
-    c2.download_button("Ödenmemiş Bildiriler", data=make_unpaid_report(bildiriler, katilimcilar), file_name="Odenmemis_Bildiriler.xlsx", use_container_width=True, key="download_odenmemis_bildiriler")
-    c2.download_button("Sadece Fiziki Katılımcılar", data=make_katilim_turu_report(katilimcilar, "FİZİKİ"), file_name="Fiziki_Katilimcilar.xlsx", use_container_width=True, key="download_fiziki_katilimcilar")
-
+    c1.download_button("Genel Katılımcı Analizi", data=make_genel_report(participants_df, authors_df, submissions_df), file_name="IHMC_Genel_Rapor.xlsx", use_container_width=True, key="dl_genel")
+    c1.download_button("Sadece Online Katılımcılar", data=make_participant_type_report(participants_df, "ONLINE"), file_name="Online_Katilimcilar.xlsx", use_container_width=True, key="dl_online")
+    c2.download_button("Ödenmemiş Bildiriler", data=make_unpaid_report(submissions_df, authors_df), file_name="Odenmemis_Bildiriler.xlsx", use_container_width=True, key="dl_unpaid")
+    c2.download_button("Sadece Fiziki Katılımcılar", data=make_participant_type_report(participants_df, "FİZİKİ"), file_name="Fiziki_Katilimcilar.xlsx", use_container_width=True, key="dl_fiziki")
     st.write("#### Yemek ve Etkinlik Listeleri")
     m1, m2, m3 = st.columns(3)
-    m1.download_button("07 Mayıs Öğle", data=make_meal_report(katilimcilar, ["7", "OGLE"]), file_name="07_Mayis_Ogle.xlsx", use_container_width=True, key="download_07_ogle")
-    m2.download_button("07 Mayıs Gala", data=make_meal_report(katilimcilar, ["GALA"]), file_name="07_Mayis_Gala.xlsx", use_container_width=True, key="download_07_gala")
-    m3.download_button("08 Mayıs Öğle", data=make_meal_report(katilimcilar, ["8", "OGLE"]), file_name="08_Mayis_Ogle.xlsx", use_container_width=True, key="download_08_ogle")
-
-    st.write("#### Zenginleştirilmiş Program")
-    df_p = raw_data.get("program_plan", pd.DataFrame()).copy()
-    if df_p.empty:
-        st.warning("Program tablosu boş.")
-    else:
-        enriched_rows = []
-        for _, row in df_p.iterrows():
-            row_dict = row.to_dict()
-            row_str = super_temiz(" ".join([str(x) for x in row.values if pd.notna(x)]))
-            b_adi = ""
-            yazarlar = ""
-            sunucu = ""
-            for _, b_v in bildiriler.items():
-                if super_temiz(b_v["Orijinal İsim"]) in row_str:
-                    b_adi = turkce_buyuk(b_v["Orijinal İsim"])
-                    yazarlar = ", ".join(
-                        [
-                            f"{turkce_buyuk(katilimcilar.get(y, {}).get('Unvan', ''))} {turkce_buyuk(katilimcilar.get(y, {}).get('Orijinal İsim', y))}".strip()
-                            for y in b_v["Yazarlar"]
-                        ]
-                    )
-                    sun = b_v["Sunucu"]
-                    sunucu = f"{turkce_buyuk(katilimcilar.get(sun, {}).get('Unvan', ''))} {turkce_buyuk(katilimcilar.get(sun, {}).get('Orijinal İsim', sun))}".strip()
-                    break
-            row_dict["Eşleşen Bildiri Adı (Sistem)"] = b_adi
-            row_dict["Yazarlar"] = yazarlar
-            row_dict["Sunucu"] = sunucu
-            enriched_rows.append(row_dict)
-
-        df_enriched = pd.DataFrame(enriched_rows)
-        filter_cols = st.columns(3)
-        secili_gun = filter_cols[0].multiselect("Gün", sorted({gun_key(x) for x in df_p["Gun_ve_Saat"].dropna().astype(str)}) if "Gun_ve_Saat" in df_p.columns else [], key="reports_program_gun_filter")
-        secili_salon = filter_cols[1].multiselect("Salon", sorted(df_p["Salon"].dropna().unique()) if "Salon" in df_p.columns else [], key="reports_program_salon_filter")
-        secili_tip = filter_cols[2].multiselect("Sunum tipi", sorted(df_p["Sunum_Tipi"].dropna().unique()) if "Sunum_Tipi" in df_p.columns else [], key="reports_program_tip_filter")
-
-        df_filtered = df_enriched.copy()
-        if "Gun_ve_Saat" in df_filtered.columns and secili_gun:
-            df_filtered = df_filtered[df_filtered["Gun_ve_Saat"].apply(gun_key).isin(secili_gun)]
-        if "Salon" in df_filtered.columns and secili_salon:
-            df_filtered = df_filtered[df_filtered["Salon"].isin(secili_salon)]
-        if "Sunum_Tipi" in df_filtered.columns and secili_tip:
-            df_filtered = df_filtered[df_filtered["Sunum_Tipi"].isin(secili_tip)]
-
-        out_prog = io.BytesIO()
-        df_filtered.to_excel(out_prog, index=False)
-        st.download_button(f"Programı İndir ({len(df_filtered)} kayıt)", data=out_prog.getvalue(), file_name="Bildiri_Sunum_Programi_Zengin.xlsx", use_container_width=True, key="download_zengin_program")
-
-
-with tab_telegram:
-    st.subheader("Telegram Bot Notu")
-    st.info(
-        "Telegram botunun uzun süreli polling ile Streamlit içinde çalışması sağlıklı değildir. "
-        "Streamlit her etkileşimde script'i yeniden çalıştırdığı için bot döngüsü kilitlenebilir veya birden fazla bot kopyası açılabilir."
-    )
-    st.write(
-        "Bu panel Telegram botunun kullandığı veri mantığını zaten içeriyor. Botu canlı tutmak istersen en temiz yapı: "
-        "bu dosyadaki veri okuma/temizleme mantığını ayrı bir `core.py` dosyasına almak ve Telegram botunu ayrı bir worker olarak çalıştırmak."
-    )
-    st.warning("Bot token'ı koda gömülmemeli. BotFather'dan token'ı yenileyip ortam değişkeni veya secrets üzerinden kullanmalısın.")
+    m1.download_button("07 Mayıs Öğle", data=make_meal_report(participants_df, ["7", "OGLE"]), file_name="07_Mayis_Ogle.xlsx", use_container_width=True, key="dl_meal_07")
+    m2.download_button("07 Mayıs Gala", data=make_meal_report(participants_df, ["GALA"]), file_name="07_Mayis_Gala.xlsx", use_container_width=True, key="dl_gala_07")
+    m3.download_button("08 Mayıs Öğle", data=make_meal_report(participants_df, ["8", "OGLE"]), file_name="08_Mayis_Ogle.xlsx", use_container_width=True, key="dl_meal_08")
+    st.write("#### Supabase Yedeği")
+    st.download_button("Tüm Veriyi Excel Yedeği Olarak İndir", data=export_master_excel(snapshot), file_name="IHMC_Supabase_Yedek.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="dl_backup")
