@@ -20,6 +20,10 @@ PROGRAM_PLAN_INDEX = 0
 PROGRAM_BILDIRILER_SHEET = "Bildiriler"
 PROGRAM_OZEL_SHEET = "Ozel_Etkinlikler"
 PROGRAM_MOD_SHEET = "Moderatorler"
+DEFAULT_KATILIMCI_SHEET_ID = "1b6K9svdyT_RrgGCFsGYO5nrmPPYw6pkvO-BTzfwNT9k"
+DEFAULT_PROGRAM_SHEET_ID = "1Polxg5n-J0VueJifvjlgoGvXITVvnBbJpgSjHJ6imYY"
+DEFAULT_KATILIMCI_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{DEFAULT_KATILIMCI_SHEET_ID}/export?format=xlsx"
+DEFAULT_PROGRAM_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{DEFAULT_PROGRAM_SHEET_ID}/export?format=xlsx"
 
 
 # =========================
@@ -237,13 +241,24 @@ def get_secret(*names):
     return None
 
 
+def normalize_supabase_url(url: str) -> str:
+    url = safe_str(url).rstrip("/")
+    url = re.sub(r"/rest/v1/?$", "", url)
+    url = re.sub(r"/auth/v1/?$", "", url)
+    url = re.sub(r"/storage/v1/?$", "", url)
+    m = re.search(r"supabase\.com/dashboard/project/([a-zA-Z0-9]+)", url)
+    if m:
+        return f"https://{m.group(1)}.supabase.co"
+    return url
+
+
 @st.cache_resource(show_spinner=False)
 def get_supabase():
     url = get_secret("SUPABASE_URL", "supabase_url")
     key = get_secret("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY", "supabase_key")
     if not url or not key:
         return None
-    return create_client(url, key)
+    return create_client(normalize_supabase_url(url), key)
 
 
 def sb():
@@ -302,6 +317,26 @@ def read_xls(uploaded_file):
     if uploaded_file is None:
         return None
     return pd.ExcelFile(io.BytesIO(uploaded_file.getvalue()))
+
+
+def google_sheet_export_url(value: str) -> str:
+    value = safe_str(value)
+    if not value:
+        return ""
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", value)
+    if not match:
+        match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", value)
+    sheet_id = match.group(1) if match else value
+    if re.fullmatch(r"[a-zA-Z0-9_-]{20,}", sheet_id):
+        return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    return value
+
+
+def read_xls_from_google(value: str):
+    url = google_sheet_export_url(value)
+    if not url:
+        return None
+    return pd.ExcelFile(url)
 
 
 def read_sheet(xls, sheet_name, default_index=None):
@@ -584,9 +619,11 @@ def build_import_payload(katilimci_xls, program_xls):
     return participant_records, submission_records, authors_by_submission, moderator_records, special_event_records
 
 
-def import_excel_to_supabase(katilimci_file, program_file):
-    katilimci_xls = read_xls(katilimci_file)
-    program_xls = read_xls(program_file) if program_file is not None else katilimci_xls
+def import_xls_to_supabase(katilimci_xls, program_xls=None):
+    if katilimci_xls is None:
+        raise ValueError("Katılımcı veri kaynağı okunamadı.")
+    if program_xls is None:
+        program_xls = katilimci_xls
     (
         participant_records,
         submission_records,
@@ -630,6 +667,18 @@ def import_excel_to_supabase(katilimci_file, program_file):
         "moderators": len(moderator_records),
         "special_events": len(special_event_records),
     }
+
+
+def import_excel_to_supabase(katilimci_file, program_file):
+    katilimci_xls = read_xls(katilimci_file)
+    program_xls = read_xls(program_file) if program_file is not None else katilimci_xls
+    return import_xls_to_supabase(katilimci_xls, program_xls)
+
+
+def import_google_sheets_to_supabase(katilimci_url, program_url):
+    katilimci_xls = read_xls_from_google(katilimci_url)
+    program_xls = read_xls_from_google(program_url) if safe_str(program_url) else katilimci_xls
+    return import_xls_to_supabase(katilimci_xls, program_xls)
 
 
 # =========================
@@ -1337,21 +1386,53 @@ tab_import, tab_search, tab_program, tab_salon, tab_mod, tab_matbaa, tab_reports
 
 with tab_import:
     st.subheader("Excel'den Supabase'e İlk Aktarım")
-    st.warning("Bu aktarım mevcut Supabase verisini silip Excel'den yeniden kurar. Normal kullanımda sadece ilk kurulumda veya büyük veri yenilemede kullan.")
-    c1, c2 = st.columns(2)
-    katilimci_file = c1.file_uploader("Katılımcı Excel'i", type=["xlsx", "xls"], key="import_katilimci_file")
-    program_file = c2.file_uploader("Program/Matbaa Excel'i", type=["xlsx", "xls"], key="import_program_file")
-    st.caption("Tek ana Excel kullanıyorsan aynı dosyayı sadece ilk alana yükle; ikinci alan boş kalabilir.")
+    st.warning("Bu aktarım mevcut Supabase verisini silip seçtiğin kaynaktan yeniden kurar. Normal kullanımda sadece ilk kurulumda veya büyük veri yenilemede kullan.")
+    import_source = st.radio(
+        "Veri kaynağı",
+        ["Excel dosyası yükle", "Google Sheets linkinden çek"],
+        horizontal=True,
+        key="import_source",
+    )
+
+    katilimci_file = None
+    program_file = None
+    katilimci_sheet_url = DEFAULT_KATILIMCI_SHEET_URL
+    program_sheet_url = DEFAULT_PROGRAM_SHEET_URL
+
+    if import_source == "Excel dosyası yükle":
+        c1, c2 = st.columns(2)
+        katilimci_file = c1.file_uploader("Katılımcı Excel'i", type=["xlsx", "xls"], key="import_katilimci_file")
+        program_file = c2.file_uploader("Program/Matbaa Excel'i", type=["xlsx", "xls"], key="import_program_file")
+        st.caption("Tek ana Excel kullanıyorsan aynı dosyayı sadece ilk alana yükle; ikinci alan boş kalabilir.")
+    else:
+        c1, c2 = st.columns(2)
+        katilimci_sheet_url = c1.text_input(
+            "Katılımcı Google Sheets linki veya Sheet ID",
+            value=DEFAULT_KATILIMCI_SHEET_URL,
+            key="import_katilimci_sheet_url",
+        )
+        program_sheet_url = c2.text_input(
+            "Program/Matbaa Google Sheets linki veya Sheet ID",
+            value=DEFAULT_PROGRAM_SHEET_URL,
+            key="import_program_sheet_url",
+        )
+        st.caption("Google Sheets dosyaları linkle görüntülenebilir olmalı. API anahtarı gerekmez; uygulama export?format=xlsx olarak okur.")
+
     confirm = st.checkbox("Mevcut Supabase verisini silip bu Excel'den yeniden yükleyeceğimi onaylıyorum.", key="import_confirm")
     if st.button("Supabase'e Aktar", key="import_button"):
-        if not katilimci_file:
+        if import_source == "Excel dosyası yükle" and not katilimci_file:
             st.error("En az bir Excel dosyası yüklemelisin.")
+        elif import_source == "Google Sheets linkinden çek" and not safe_str(katilimci_sheet_url):
+            st.error("Katılımcı Google Sheets linki gerekli.")
         elif not confirm:
             st.error("Silme/yükleme onayını işaretlemen gerekiyor.")
         else:
             try:
-                with st.spinner("Excel okunuyor ve Supabase'e aktarılıyor..."):
-                    summary = import_excel_to_supabase(katilimci_file, program_file)
+                with st.spinner("Veri kaynağı okunuyor ve Supabase'e aktarılıyor..."):
+                    if import_source == "Excel dosyası yükle":
+                        summary = import_excel_to_supabase(katilimci_file, program_file)
+                    else:
+                        summary = import_google_sheets_to_supabase(katilimci_sheet_url, program_sheet_url)
                 st.cache_data.clear()
                 st.success(
                     f"Aktarım tamamlandı: {summary['participants']} kişi, {summary['submissions']} bildiri, "
